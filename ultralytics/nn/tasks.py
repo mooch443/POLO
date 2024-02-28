@@ -54,6 +54,7 @@ from ultralytics.nn.modules import (
     HGStem,
     ImagePoolingAttn,
     Index,
+    Locate,
     LRPCHead,
     Pose,
     Pose26,
@@ -80,6 +81,7 @@ from ultralytics.utils.loss import (
     PoseLoss26,
     v8ClassificationLoss,
     v8DetectionLoss,
+    v8LocalizationLoss,
     v8OBBLoss,
     v8PoseLoss,
     v8SegmentationLoss,
@@ -492,6 +494,58 @@ class DetectionModel(BaseModel):
     def init_criterion(self):
         """Initialize the loss criterion for the DetectionModel."""
         return E2ELoss(self) if getattr(self, "end2end", False) else v8DetectionLoss(self)
+
+
+class LocalizationModel(BaseModel):
+    """YOLO localization model for point-based detection."""
+
+    def __init__(self, cfg="polov8n.yaml", ch=3, nc=None, verbose=True):
+        """Initialize the YOLO localization model with the given config and parameters."""
+        super().__init__()
+        self.yaml = cfg if isinstance(cfg, dict) else yaml_model_load(cfg)  # cfg dict
+        if self.yaml["backbone"][0][2] == "Silence":
+            LOGGER.warning(
+                "YOLOv9 `Silence` module is deprecated in favor of torch.nn.Identity. "
+                "Please delete local *.pt file and re-download the latest model checkpoint."
+            )
+            self.yaml["backbone"][0][2] = "nn.Identity"
+
+        # Define model
+        self.yaml["channels"] = ch  # save channels
+        if nc and nc != self.yaml["nc"]:
+            LOGGER.info(f"Overriding model.yaml nc={self.yaml['nc']} with nc={nc}")
+            self.yaml["nc"] = nc  # override YAML value
+        self.model, self.save = parse_model(deepcopy(self.yaml), ch=ch, verbose=verbose)  # model, savelist
+        self.names = {i: f"{i}" for i in range(self.yaml["nc"])}  # default names dict
+        self.inplace = self.yaml.get("inplace", True)
+
+        # Build strides
+        m = self.model[-1]  # Locate()
+        if isinstance(m, Locate):
+            s = 256  # 2x min stride
+            m.inplace = self.inplace
+            self.model.eval()  # Avoid changing batch statistics until training begins
+            m.training = True  # Setting it to True to properly return strides
+            m.stride = torch.tensor([s / x.shape[-2] for x in self.forward(torch.zeros(1, ch, s, s))])  # forward
+            self.stride = m.stride
+            self.model.train()  # Set model back to training(default) mode
+            m.bias_init()  # only run once
+        else:
+            self.stride = torch.Tensor([32])  # default stride, e.g., RTDETR
+
+        # Init weights, biases
+        initialize_weights(self)
+        if verbose:
+            self.info()
+            LOGGER.info("")
+
+    def _predict_augment(self, x):
+        """Localization models do not support augmented prediction."""
+        raise NotImplementedError("Augmented prediction not implemented for localization models.")
+
+    def init_criterion(self):
+        """Initialize the loss criterion for the LocalizationModel."""
+        return v8LocalizationLoss(self)
 
 
 class OBBModel(DetectionModel):
