@@ -82,6 +82,7 @@ class YOLODataset(BaseDataset):
         """
         self.use_segments = task == "segment"
         self.use_keypoints = task == "pose"
+        self.use_locations == task == "locate"
         self.use_obb = task == "obb"
         self.data = data
         assert not (self.use_segments and self.use_keypoints), "Can not use both segments and keypoints."
@@ -114,6 +115,7 @@ class YOLODataset(BaseDataset):
                     self.label_files,
                     repeat(self.prefix),
                     repeat(self.use_keypoints),
+                    repeat(self.use_locations),
                     repeat(len(self.data["names"])),
                     repeat(nkpt),
                     repeat(ndim),

@@ -179,7 +179,7 @@ def verify_image(args: tuple) -> tuple:
 
 def verify_image_label(args: tuple) -> list:
     """Verify one image-label pair."""
-    im_file, lb_file, prefix, keypoint, num_cls, nkpt, ndim, single_cls = args
+    im_file, lb_file, prefix, keypoint, location, num_cls, nkpt, ndim, single_cls = args
     # Number (missing, found, empty, corrupt), message, segments, keypoints
     nm, nf, ne, nc, msg, segments, keypoints = 0, 0, 0, 0, "", [], None
     try:
@@ -211,6 +211,9 @@ def verify_image_label(args: tuple) -> list:
                 if keypoint:
                     assert lb.shape[1] == (5 + nkpt * ndim), f"labels require {(5 + nkpt * ndim)} columns each"
                     points = lb[:, 5:].reshape(-1, ndim)[:, :2]
+                elif location:
+                    assert lb.shape[1] == 4, f"locations require 4 columns, {lb.shape[1]} columns detected"
+                    points = lb[:, 2:]
                 else:
                     assert lb.shape[1] == 5, f"labels require 5 columns, {lb.shape[1]} columns detected"
                     points = lb[:, 1:]
@@ -232,16 +235,26 @@ def verify_image_label(args: tuple) -> list:
                     msg = f"{prefix}{im_file}: {nl - len(i)} duplicate labels removed"
             else:
                 ne = 1  # label empty
-                lb = np.zeros((0, (5 + nkpt * ndim) if keypoint else 5), dtype=np.float32)
+                if keypoint:
+                    lb = np.zeros((0, (5 + nkpt * ndim)), dtype=np.float32)
+                elif location:
+                    lb = np.zeros((0, 4), dtype=np.float32)
+                else:
+                    lb = np.zeros((0, 5), dtype=np.float32)
         else:
             nm = 1  # label missing
-            lb = np.zeros((0, (5 + nkpt * ndim) if keypoint else 5), dtype=np.float32)
+            if keypoint:
+                lb = np.zeros((0, (5 + nkpt * ndim)), dtype=np.float32)
+            elif location:
+                lb = np.zeros((0, 4), dtype=np.float32)
+            else:
+                lb = np.zeros((0, 5), dtype=np.float32)
         if keypoint:
             keypoints = lb[:, 5:].reshape(-1, nkpt, ndim)
             if ndim == 2:
                 kpt_mask = np.where((keypoints[..., 0] < 0) | (keypoints[..., 1] < 0), 0.0, 1.0).astype(np.float32)
                 keypoints = np.concatenate([keypoints, kpt_mask[..., None]], axis=-1)  # (nl, nkpt, 3)
-        lb = lb[:, :5]
+        lb = lb[:, :5] if not location else lb[:, :4]
         return im_file, lb, shape, segments, keypoints, nm, nf, ne, nc, msg
     except Exception as e:
         nc = 1
