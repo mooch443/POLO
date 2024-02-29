@@ -56,6 +56,7 @@ MODES = frozenset({"train", "val", "predict", "export", "track", "benchmark"})
 TASKS = frozenset({"detect", "segment", "classify", "pose", "obb"})
 TASK2DATA = {
     "detect": "coco8.yaml",
+    "locate": "coco8.yaml",
     "segment": "coco8-seg.yaml",
     "classify": "imagenet10",
     "pose": "coco8-pose.yaml",
