@@ -13,6 +13,7 @@ from ultralytics.models import yolo
 from ultralytics.nn.tasks import (
     ClassificationModel,
     DetectionModel,
+    LocalizationModel,
     OBBModel,
     PoseModel,
     SegmentationModel,
@@ -96,6 +97,12 @@ class YOLO(Model):
                 "trainer": yolo.detect.DetectionTrainer,
                 "validator": yolo.detect.DetectionValidator,
                 "predictor": yolo.detect.DetectionPredictor,
+            },
+            "locate": {
+                "model": LocalizationModel,
+                "trainer": yolo.locate.LocalizationTrainer,
+                "validator": yolo.locate.LocalizationValidator,
+                "predictor": yolo.locate.LocalizationPredictor,
             },
             "segment": {
                 "model": SegmentationModel,

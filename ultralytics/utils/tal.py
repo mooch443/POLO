@@ -443,7 +443,6 @@ def dist2rbox(pred_dist, pred_angle, anchor_points, dim=-1):
     xy = torch.cat([x, y], dim=dim) + anchor_points
     return torch.cat([xy, lt + rb], dim=dim)
 
-
 def rbox2dist(
     target_bboxes: torch.Tensor,
     anchor_points: torch.Tensor,
@@ -481,3 +480,9 @@ def rbox2dist(
         dist = dist.clamp_(0, reg_max - 0.01)
 
     return dist
+
+
+def dist2coords(distance, anchor_points, dim=-1):
+    """Transform distance to coordinates."""
+    center_coords = anchor_points + distance
+    return center_coords

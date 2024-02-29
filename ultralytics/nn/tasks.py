@@ -1846,6 +1846,8 @@ def guess_model_task(model):
                 return "obb"
             elif isinstance(m, (Detect, WorldDetect, YOLOEDetect, v10Detect)):
                 return "detect"
+            elif isinstance(m, Locate):
+                return "locate"
 
     # Guess from model filename
     if isinstance(model, (str, Path)):
@@ -1858,6 +1860,8 @@ def guess_model_task(model):
             return "pose"
         elif "-obb" in model.stem or "obb" in model.parts:
             return "obb"
+        elif "-loc" in model.stem or "locate" in model.parts:
+            return "locate"
         elif "detect" in model.parts:
             return "detect"
 
