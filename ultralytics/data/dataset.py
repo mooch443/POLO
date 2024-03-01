@@ -82,7 +82,7 @@ class YOLODataset(BaseDataset):
         """
         self.use_segments = task == "segment"
         self.use_keypoints = task == "pose"
-        self.use_locations == task == "locate"
+        self.use_locations = task == "locate"
         self.use_obb = task == "obb"
         self.data = data
         assert not (self.use_segments and self.use_keypoints), "Can not use both segments and keypoints."
@@ -130,16 +130,18 @@ class YOLODataset(BaseDataset):
                 nc += nc_f
                 if im_file:
                     x["labels"].append(
-                        {
-                            "im_file": im_file,
-                            "shape": shape,
-                            "cls": lb[:, 0:1],  # n, 1
-                            "bboxes": lb[:, 1:],  # n, 4
-                            "segments": segments,
-                            "keypoints": keypoint,
-                            "normalized": True,
-                            "bbox_format": "xywh",
-                        }
+                        dict(
+                            im_file=im_file,
+                            shape=shape,
+                            cls=lb[:, 0:1],  # n, 1
+                            bboxes=lb[:, 1:] if not self.use_locations else None,  # n, 4
+                            radii=lb[:, 1:2] if self.use_locations else None,
+                            locations=lb[:, 2:] if self.use_locations else None,  # n, 2
+                            segments=segments,
+                            keypoints=keypoint,
+                            normalized=True,
+                            bbox_format="xywh",
+                        )
                     )
                 if msg:
                     msgs.append(msg)
@@ -190,17 +192,19 @@ class YOLODataset(BaseDataset):
             )
         self.im_files = [lb["im_file"] for lb in labels]  # update im_files
 
-        # Check if the dataset is all boxes or all segments
-        lengths = ((len(lb["cls"]), len(lb["bboxes"]), len(lb["segments"])) for lb in labels)
-        len_cls, len_boxes, len_segments = (sum(x) for x in zip(*lengths))
-        if len_segments and len_boxes != len_segments:
-            LOGGER.warning(
-                f"Box and segment counts should be equal, but got len(segments) = {len_segments}, "
-                f"len(boxes) = {len_boxes}. To resolve this only boxes will be used and all segments will be removed. "
-                "To avoid this please supply either a detect or segment dataset, not a detect-segment mixed dataset."
-            )
-            for lb in labels:
-                lb["segments"] = []
+        len_cls = sum([len(lb["cls"]) for lb in labels])
+        if not self.use_locations:
+            # Check if the dataset is all boxes/locations or all segments
+            lengths = ((len(lb["bboxes"]), len(lb["segments"])) for lb in labels)
+            len_boxes, len_segments = (sum(x) for x in zip(*lengths))
+            if len_segments and len_boxes != len_segments:
+                LOGGER.warning(
+                    f"WARNING ⚠️ Box and segment counts should be equal, but got len(segments) = {len_segments}, "
+                    f"len(boxes) = {len_boxes}. To resolve this only boxes will be used and all segments will be removed. "
+                    "To avoid this please supply either a detect or segment dataset, not a detect-segment mixed dataset."
+                )
+                for lb in labels:
+                    lb["segments"] = []
         if len_cls == 0:
             LOGGER.warning(f"Labels are missing or empty in {cache_path}, training may not work correctly. {HELP_URL}")
         return labels
