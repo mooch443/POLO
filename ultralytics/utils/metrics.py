@@ -514,15 +514,14 @@ class ConfusionMatrix(DataExportMixin):
         for i, gc in enumerate(gt_classes):
             j = m0 == i
             if n and sum(j) == 1:
-                self.matrix[location_classes[m1[j]], gc] += 1  # correct
+                self.matrix[localization_classes[m1[j]], gc] += 1  # correct
             else:
                 self.matrix[self.nc, gc] += 1  # true background
 
         if n:
-            for i, lc in enumerate(location_classes):
+            for i, lc in enumerate(localization_classes):
                 if not any(m1 == i):
                     self.matrix[lc, self.nc] += 1  # predicted background
-    
 
     def matrix(self):
         """Return the confusion matrix."""
