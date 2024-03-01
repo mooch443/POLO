@@ -305,30 +305,41 @@ def smooth_bce(eps: float = 0.1) -> tuple[float, float]:
     return 1.0 - 0.5 * eps, 0.5 * eps
 
 
+def loc_dor_pw(loc1, loc2, radii, eps=1e-7):
+    """Calculate pairwise Distance-over-Radius (DoR) between locations."""
+    pairwise_dist = torch.cdist(loc1, loc2)
+    pw_dor = pairwise_dist / radii.view(loc1.shape[0], -1)
+    return pw_dor + eps
+
+
+def loc_dor(loc1, loc2, radii, eps=1e-7):
+    """Calculate Distance-over-Radius (DoR) for aligned location pairs."""
+    radii = radii.view(-1)
+    return torch.linalg.norm(loc1 - loc2, dim=-1) / radii + eps
+
+
 class ConfusionMatrix(DataExportMixin):
-    """A class for calculating and updating a confusion matrix for object detection and classification tasks.
+    """A class for calculating and updating a confusion matrix for object detection and classification tasks."""
 
-    Attributes:
-        task (str): The type of task, either 'detect' or 'classify'.
-        matrix (np.ndarray): The confusion matrix, with dimensions depending on the task.
-        nc (int): The number of classes.
-        names (list[str]): The names of the classes, used as labels on the plot.
-        matches (dict): Contains the indices of ground truths and predictions categorized into TP, FP and FN.
-    """
-
-    def __init__(self, names: dict[int, str] = {}, task: str = "detect", save_matches: bool = False):
-        """Initialize a ConfusionMatrix instance.
-
-        Args:
-            names (dict[int, str], optional): Names of classes, used as labels on the plot.
-            task (str, optional): Type of task, either 'detect' or 'classify'.
-            save_matches (bool, optional): Save the indices of GTs, TPs, FPs, FNs for visualization.
-        """
+    def __init__(
+        self,
+        names: dict[int, str] | None = None,
+        task: str = "detect",
+        save_matches: bool = False,
+        nc: int | None = None,
+        conf: float = 0.25,
+        iou_thres: float = 0.45,
+        dor_thresh: float = 1.0,
+    ):
+        """Initialize a ConfusionMatrix instance."""
         self.task = task
-        self.nc = len(names)  # number of classes
+        self.names = names or {}
+        self.nc = len(self.names) if nc is None else nc
         self.matrix = np.zeros((self.nc, self.nc)) if self.task == "classify" else np.zeros((self.nc + 1, self.nc + 1))
-        self.names = names  # name of classes
         self.matches = {} if save_matches else None
+        self.conf = 0.25 if conf in (None, 0.001) else conf  # apply 0.25 if default val conf is passed
+        self.iou_thres = iou_thres
+        self.dor_thres = dor_thresh
 
     def _append_matches(self, mtype: str, batch: dict[str, Any], idx: int) -> None:
         """Append the matches to TP, FP, FN or GT list for the last batch.
@@ -444,6 +455,74 @@ class ConfusionMatrix(DataExportMixin):
             if not any(m1 == i):
                 self.matrix[dc, self.nc] += 1  # FP
                 self._append_matches("FP", detections, i)
+
+    def process_batch_loc(self, localizations, gt_locs, gt_cls, radii):
+        """
+        Update confusion matrix for localization task.
+
+        Args:
+            localizations (Array[M, 4]): Detected locations and their associated information.
+                                         Each row should contain (x, y, conf, class).
+            gt_locs (Array[M, 2]): Ground truth locations in xy format.
+            gt_cls (Array[M]): The class labels.
+            radii (Array[M, 1]): Radii for DoR calculation per ground-truth instance.
+        """
+        if gt_cls.shape[0] == 0:  # Check if labels is empty
+            if localizations is not None:
+                localizations = localizations[localizations[:, 2] > self.conf]
+                location_classes = localizations[:, 3].int()
+                for lc in location_classes:
+                    self.matrix[lc, self.nc] += 1  # false positives
+            return
+        if localizations is None or localizations.shape[0] == 0:
+            gt_classes = gt_cls.int()
+            for gc in gt_classes:
+                self.matrix[self.nc, gc] += 1  # background FN
+            return
+
+        localizations = localizations[localizations[:, 2] > self.conf]
+        if localizations.shape[0] == 0:
+            gt_classes = gt_cls.int()
+            for gc in gt_classes:
+                self.matrix[self.nc, gc] += 1  # background FN
+            return
+
+        gt_classes = gt_cls.int()
+        location_classes = localizations[:, 3].int()
+        dor = loc_dor_pw(loc1=gt_locs, loc2=localizations[:, :2], radii=radii)
+
+
+        '''
+        The following block finds predictions whose confidence exceeds the threshold, and removes 
+        duplicates for a given ground truth (the more confident prediction is kept). As far as I
+        understand, this removes the need to implement a condition to count double detections as 
+        false positives - at least for validation. 
+        '''
+        x = torch.where(dor <= self.dor_thres)
+        if x[0].shape[0]:
+            matches = torch.cat((torch.stack(x, 1), dor[x[0], x[1]][:, None]), 1).cpu().numpy()
+            if x[0].shape[0] > 1:
+                matches = matches[matches[:, 2].argsort()[::-1]]
+                matches = matches[np.unique(matches[:, 1], return_index=True)[1]]
+                matches = matches[matches[:, 2].argsort()[::-1]]
+                matches = matches[np.unique(matches[:, 0], return_index=True)[1]]
+        else:
+            matches = np.zeros((0, 3))
+
+        n = matches.shape[0] > 0
+        m0, m1, _ = matches.transpose().astype(int)
+        for i, gc in enumerate(gt_classes):
+            j = m0 == i
+            if n and sum(j) == 1:
+                self.matrix[location_classes[m1[j]], gc] += 1  # correct
+            else:
+                self.matrix[self.nc, gc] += 1  # true background
+
+        if n:
+            for i, lc in enumerate(location_classes):
+                if not any(m1 == i):
+                    self.matrix[lc, self.nc] += 1  # predicted background
+    
 
     def matrix(self):
         """Return the confusion matrix."""
