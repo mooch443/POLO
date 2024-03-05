@@ -179,7 +179,7 @@ class Bboxes:
 
 
 class Instances:
-    """Container for bounding boxes, segments, and keypoints of detected objects in an image.
+    """Container for bounding boxes, locations, segments, and keypoints of detected objects in an image.
 
     This class provides a unified interface for handling different types of object annotations including bounding boxes,
     segmentation masks, and keypoints. It supports various operations like scaling, normalization, clipping, and format
@@ -187,6 +187,7 @@ class Instances:
 
     Attributes:
         _bboxes (Bboxes): Internal object for handling bounding box operations.
+        locations (np.ndarray | None): Locations array with shape (N, 2).
         keypoints (np.ndarray): Keypoints with shape (N, 17, 3) in format (x, y, visible).
         normalized (bool): Flag indicating whether the bounding box coordinates are normalized.
         segments (np.ndarray): Segments array with shape (N, M, 2) after resampling.
@@ -215,22 +216,25 @@ class Instances:
 
     def __init__(
         self,
-        bboxes: np.ndarray,
-        segments: np.ndarray = None,
-        keypoints: np.ndarray = None,
+        bboxes: np.ndarray | None = None,
+        locations: np.ndarray | None = None,
+        segments: np.ndarray | None = None,
+        keypoints: np.ndarray | None = None,
         bbox_format: str = "xywh",
         normalized: bool = True,
     ) -> None:
-        """Initialize the Instances object with bounding boxes, segments, and keypoints.
+        """Initialize the Instances object with bounding boxes, locations, segments, and keypoints.
 
         Args:
-            bboxes (np.ndarray): Bounding boxes with shape (N, 4).
+            bboxes (np.ndarray, optional): Bounding boxes with shape (N, 4).
+            locations (np.ndarray, optional): Locations with shape (N, 2).
             segments (np.ndarray, optional): Segmentation masks.
             keypoints (np.ndarray, optional): Keypoints with shape (N, 17, 3) in format (x, y, visible).
             bbox_format (str): Format of bboxes.
             normalized (bool): Whether the coordinates are normalized.
         """
-        self._bboxes = Bboxes(bboxes=bboxes, format=bbox_format)
+        self._bboxes = Bboxes(bboxes=bboxes, format=bbox_format) if bboxes is not None else None
+        self.locations = locations
         self.keypoints = keypoints
         self.normalized = normalized
         self.segments = segments
@@ -241,12 +245,14 @@ class Instances:
         Args:
             format (str): Target format for conversion, one of 'xyxy', 'xywh', or 'ltwh'.
         """
+        if self._bboxes is None:
+            return
         self._bboxes.convert(format=format)
 
     @property
     def bbox_areas(self) -> np.ndarray:
         """Calculate the area of bounding boxes."""
-        return self._bboxes.areas()
+        return self._bboxes.areas() if self._bboxes is not None else np.zeros(0)
 
     def scale(self, scale_w: float, scale_h: float, bbox_only: bool = False):
         """Scale coordinates by given factors.
@@ -256,11 +262,16 @@ class Instances:
             scale_h (float): Scale factor for height.
             bbox_only (bool, optional): Whether to scale only bounding boxes.
         """
-        self._bboxes.mul(scale=(scale_w, scale_h, scale_w, scale_h))
-        if bbox_only:
-            return
-        self.segments[..., 0] *= scale_w
-        self.segments[..., 1] *= scale_h
+        if self._bboxes is not None:
+            self._bboxes.mul(scale=(scale_w, scale_h, scale_w, scale_h))
+            if bbox_only:
+                return
+        if self.locations is not None:
+            self.locations[:, 0] *= scale_w
+            self.locations[:, 1] *= scale_h
+        if self.segments is not None:
+            self.segments[..., 0] *= scale_w
+            self.segments[..., 1] *= scale_h
         if self.keypoints is not None:
             self.keypoints[..., 0] *= scale_w
             self.keypoints[..., 1] *= scale_h
@@ -274,9 +285,14 @@ class Instances:
         """
         if not self.normalized:
             return
-        self._bboxes.mul(scale=(w, h, w, h))
-        self.segments[..., 0] *= w
-        self.segments[..., 1] *= h
+        if self._bboxes is not None:
+            self._bboxes.mul(scale=(w, h, w, h))
+        if self.locations is not None:
+            self.locations[:, 0] *= w
+            self.locations[:, 1] *= h
+        if self.segments is not None:
+            self.segments[..., 0] *= w
+            self.segments[..., 1] *= h
         if self.keypoints is not None:
             self.keypoints[..., 0] *= w
             self.keypoints[..., 1] *= h
@@ -291,9 +307,14 @@ class Instances:
         """
         if self.normalized:
             return
-        self._bboxes.mul(scale=(1 / w, 1 / h, 1 / w, 1 / h))
-        self.segments[..., 0] /= w
-        self.segments[..., 1] /= h
+        if self._bboxes is not None:
+            self._bboxes.mul(scale=(1 / w, 1 / h, 1 / w, 1 / h))
+        if self.locations is not None:
+            self.locations[:, 0] /= w
+            self.locations[:, 1] /= h
+        if self.segments is not None:
+            self.segments[..., 0] /= w
+            self.segments[..., 1] /= h
         if self.keypoints is not None:
             self.keypoints[..., 0] /= w
             self.keypoints[..., 1] /= h
@@ -307,9 +328,14 @@ class Instances:
             padh (int): Padding height.
         """
         assert not self.normalized, "you should add padding with absolute coordinates."
-        self._bboxes.add(offset=(padw, padh, padw, padh))
-        self.segments[..., 0] += padw
-        self.segments[..., 1] += padh
+        if self._bboxes is not None:
+            self._bboxes.add(offset=(padw, padh, padw, padh))
+        if self.locations is not None:
+            self.locations[:, 0] += padw
+            self.locations[:, 1] += padh
+        if self.segments is not None:
+            self.segments[..., 0] += padw
+            self.segments[..., 1] += padh
         if self.keypoints is not None:
             self.keypoints[..., 0] += padw
             self.keypoints[..., 1] += padh
@@ -327,12 +353,14 @@ class Instances:
             When using boolean indexing, make sure to provide a boolean array with the same length as the number of
             instances.
         """
-        segments = self.segments[index] if len(self.segments) else self.segments
+        locations = self.locations[index] if self.locations is not None else None
+        segments = self.segments[index] if self.segments is not None and len(self.segments) else self.segments
         keypoints = self.keypoints[index] if self.keypoints is not None else None
-        bboxes = self.bboxes[index]
-        bbox_format = self._bboxes.format
+        bboxes = self.bboxes[index] if self._bboxes is not None else None
+        bbox_format = self._bboxes.format if self._bboxes is not None else "xywh"
         return Instances(
             bboxes=bboxes,
+            locations=locations,
             segments=segments,
             keypoints=keypoints,
             bbox_format=bbox_format,
@@ -345,14 +373,18 @@ class Instances:
         Args:
             h (int): Image height.
         """
-        if self._bboxes.format == "xyxy":
-            y1 = self.bboxes[:, 1].copy()
-            y2 = self.bboxes[:, 3].copy()
-            self.bboxes[:, 1] = h - y2
-            self.bboxes[:, 3] = h - y1
-        else:
-            self.bboxes[:, 1] = h - self.bboxes[:, 1]
-        self.segments[..., 1] = h - self.segments[..., 1]
+        if self._bboxes is not None:
+            if self._bboxes.format == "xyxy":
+                y1 = self.bboxes[:, 1].copy()
+                y2 = self.bboxes[:, 3].copy()
+                self.bboxes[:, 1] = h - y2
+                self.bboxes[:, 3] = h - y1
+            else:
+                self.bboxes[:, 1] = h - self.bboxes[:, 1]
+        if self.locations is not None:
+            self.locations[:, 1] = h - self.locations[:, 1]
+        if self.segments is not None:
+            self.segments[..., 1] = h - self.segments[..., 1]
         if self.keypoints is not None:
             self.keypoints[..., 1] = h - self.keypoints[..., 1]
 
@@ -362,14 +394,18 @@ class Instances:
         Args:
             w (int): Image width.
         """
-        if self._bboxes.format == "xyxy":
-            x1 = self.bboxes[:, 0].copy()
-            x2 = self.bboxes[:, 2].copy()
-            self.bboxes[:, 0] = w - x2
-            self.bboxes[:, 2] = w - x1
-        else:
-            self.bboxes[:, 0] = w - self.bboxes[:, 0]
-        self.segments[..., 0] = w - self.segments[..., 0]
+        if self._bboxes is not None:
+            if self._bboxes.format == "xyxy":
+                x1 = self.bboxes[:, 0].copy()
+                x2 = self.bboxes[:, 2].copy()
+                self.bboxes[:, 0] = w - x2
+                self.bboxes[:, 2] = w - x1
+            else:
+                self.bboxes[:, 0] = w - self.bboxes[:, 0]
+        if self.locations is not None:
+            self.locations[:, 0] = w - self.locations[:, 0]
+        if self.segments is not None:
+            self.segments[..., 0] = w - self.segments[..., 0]
         if self.keypoints is not None:
             self.keypoints[..., 0] = w - self.keypoints[..., 0]
 
@@ -380,14 +416,19 @@ class Instances:
             w (int): Image width.
             h (int): Image height.
         """
-        ori_format = self._bboxes.format
-        self.convert_bbox(format="xyxy")
-        self.bboxes[:, [0, 2]] = self.bboxes[:, [0, 2]].clip(0, w)
-        self.bboxes[:, [1, 3]] = self.bboxes[:, [1, 3]].clip(0, h)
-        if ori_format != "xyxy":
-            self.convert_bbox(format=ori_format)
-        self.segments[..., 0] = self.segments[..., 0].clip(0, w)
-        self.segments[..., 1] = self.segments[..., 1].clip(0, h)
+        if self._bboxes is not None:
+            ori_format = self._bboxes.format
+            self.convert_bbox(format="xyxy")
+            self.bboxes[:, [0, 2]] = self.bboxes[:, [0, 2]].clip(0, w)
+            self.bboxes[:, [1, 3]] = self.bboxes[:, [1, 3]].clip(0, h)
+            if ori_format != "xyxy":
+                self.convert_bbox(format=ori_format)
+        if self.locations is not None:
+            self.locations[:, 0] = self.locations[:, 0].clip(0, w)
+            self.locations[:, 1] = self.locations[:, 1].clip(0, h)
+        if self.segments is not None:
+            self.segments[..., 0] = self.segments[..., 0].clip(0, w)
+            self.segments[..., 1] = self.segments[..., 1].clip(0, h)
         if self.keypoints is not None:
             # Set out of bounds visibility to zero
             self.keypoints[..., 2][
@@ -405,24 +446,33 @@ class Instances:
         Returns:
             (np.ndarray): Boolean array indicating which boxes were kept.
         """
+        if self._bboxes is None:
+            n = len(self.locations) if self.locations is not None else 0
+            return np.ones(n, dtype=bool)
         good = self.bbox_areas > 0
         if not all(good):
             self._bboxes = self._bboxes[good]
-            if len(self.segments):
+            if self.locations is not None:
+                self.locations = self.locations[good]
+            if self.segments is not None and len(self.segments):
                 self.segments = self.segments[good]
             if self.keypoints is not None:
                 self.keypoints = self.keypoints[good]
         return good
 
-    def update(self, bboxes: np.ndarray, segments: np.ndarray = None, keypoints: np.ndarray = None):
-        """Update instance variables.
-
-        Args:
-            bboxes (np.ndarray): New bounding boxes.
-            segments (np.ndarray, optional): New segments.
-            keypoints (np.ndarray, optional): New keypoints.
-        """
-        self._bboxes = Bboxes(bboxes, format=self._bboxes.format)
+    def update(
+        self,
+        bboxes: np.ndarray | None = None,
+        locations: np.ndarray | None = None,
+        segments: np.ndarray | None = None,
+        keypoints: np.ndarray | None = None,
+    ):
+        """Update instance variables."""
+        if bboxes is not None:
+            fmt = self._bboxes.format if self._bboxes is not None else "xywh"
+            self._bboxes = Bboxes(bboxes, format=fmt)
+        if locations is not None:
+            self.locations = locations
         if segments is not None:
             self.segments = segments
         if keypoints is not None:
@@ -430,7 +480,9 @@ class Instances:
 
     def __len__(self) -> int:
         """Return the number of instances."""
-        return len(self.bboxes)
+        if self._bboxes is not None:
+            return len(self.bboxes)
+        return len(self.locations) if self.locations is not None else 0
 
     @classmethod
     def concatenate(cls, instances_list: list[Instances], axis=0) -> Instances:
@@ -456,27 +508,34 @@ class Instances:
         if len(instances_list) == 1:
             return instances_list[0]
 
+        use_locations = instances_list[0].locations is not None
         use_keypoint = instances_list[0].keypoints is not None
-        bbox_format = instances_list[0]._bboxes.format
+        bbox_format = instances_list[0]._bboxes.format if instances_list[0]._bboxes is not None else "xywh"
         normalized = instances_list[0].normalized
 
-        cat_boxes = np.concatenate([ins.bboxes for ins in instances_list], axis=axis)
-        seg_len = [b.segments.shape[1] for b in instances_list]
-        if len(frozenset(seg_len)) > 1:  # resample segments if there's different length
-            max_len = max(seg_len)
-            cat_segments = np.concatenate(
-                [
-                    resample_segments(list(b.segments), max_len)
-                    if len(b.segments)
-                    else np.zeros((0, max_len, 2), dtype=np.float32)  # re-generating empty segments
-                    for b in instances_list
-                ],
-                axis=axis,
-            )
+        cat_boxes = np.concatenate([ins.bboxes for ins in instances_list], axis=axis) if not use_locations else None
+        cat_locations = (
+            np.concatenate([ins.locations for ins in instances_list], axis=axis) if use_locations else None
+        )
+        if not use_locations:
+            seg_len = [b.segments.shape[1] for b in instances_list]
+            if len(frozenset(seg_len)) > 1:  # resample segments if there's different length
+                max_len = max(seg_len)
+                cat_segments = np.concatenate(
+                    [
+                        resample_segments(list(b.segments), max_len)
+                        if len(b.segments)
+                        else np.zeros((0, max_len, 2), dtype=np.float32)  # re-generating empty segments
+                        for b in instances_list
+                    ],
+                    axis=axis,
+                )
+            else:
+                cat_segments = np.concatenate([b.segments for b in instances_list], axis=axis)
         else:
-            cat_segments = np.concatenate([b.segments for b in instances_list], axis=axis)
+            cat_segments = np.concatenate([b.segments for b in instances_list], axis=axis) if instances_list[0].segments is not None else None
         cat_keypoints = np.concatenate([b.keypoints for b in instances_list], axis=axis) if use_keypoint else None
-        return cls(cat_boxes, cat_segments, cat_keypoints, bbox_format, normalized)
+        return cls(cat_boxes, cat_locations, cat_segments, cat_keypoints, bbox_format, normalized)
 
     @property
     def bboxes(self) -> np.ndarray:
