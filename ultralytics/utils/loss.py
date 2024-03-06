@@ -11,7 +11,14 @@ import torch.nn.functional as F
 
 from ultralytics.utils.metrics import OKS_SIGMA, RLE_WEIGHT
 from ultralytics.utils.ops import crop_mask, xywh2xyxy, xyxy2xywh
-from ultralytics.utils.tal import RotatedTaskAlignedAssigner, TaskAlignedAssigner, dist2bbox, dist2rbox, make_anchors
+from ultralytics.utils.tal import (
+    LocTaskAlignedAssigner,
+    RotatedTaskAlignedAssigner,
+    TaskAlignedAssigner,
+    dist2bbox,
+    dist2rbox,
+    make_anchors,
+)
 from ultralytics.utils.torch_utils import autocast
 
 from .metrics import bbox_iou, probiou
@@ -466,6 +473,117 @@ class v8DetectionLoss:
         batch_size = preds["boxes"].shape[0]
         loss, loss_detach = self.get_assigned_targets_and_loss(preds, batch)[1:]
         return loss * batch_size, loss_detach
+
+
+class MSELoss(nn.Module):
+    """Mean squared error loss with a foreground mask."""
+
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, pred_locations, target_locations, fg_mask):
+        """Compute masked MSE loss for location regression."""
+        diff = (pred_locations - target_locations) ** 2
+        diff = diff.sum(dim=-1)
+        fg_mask = fg_mask.float()
+        return (diff * fg_mask).sum() / max(fg_mask.sum(), 1.0)
+
+
+class v8LocalizationLoss:
+    """Criterion class for computing point-based localization losses."""
+
+    def __init__(self, model):  # model must be de-paralleled
+        """Initialize v8LocalizationLoss with the model, defining model-related properties and BCE loss function."""
+        device = next(model.parameters()).device
+        h = model.args
+        m = model.model[-1]  # Locate() module
+        self.bce = nn.BCEWithLogitsLoss(reduction="none")
+        self.loc_loss = MSELoss()
+        self.radii = model.radii
+        self.hyp = h
+        self.stride = m.stride
+        self.nc = m.nc
+        self.no = m.no
+        self.reg_max = m.reg_max
+        self.device = device
+
+        self.assigner = LocTaskAlignedAssigner(topk=10, num_classes=self.nc, alpha=0.5, beta=6.0)
+        self.proj = torch.arange(m.reg_max, dtype=torch.float, device=device)
+
+    def preprocess(self, targets, batch_size, scale_tensor):
+        """Preprocess targets to per-image tensors."""
+        if targets.shape[0] == 0:
+            out = torch.zeros(batch_size, 0, 4, device=self.device)
+        else:
+            i = targets[:, 0]  # image index
+            _, counts = i.unique(return_counts=True)
+            counts = counts.to(dtype=torch.int32)
+            out = torch.zeros(batch_size, counts.max(), 4, device=self.device)
+            for j in range(batch_size):
+                matches = i == j
+                n = matches.sum()
+                if n:
+                    out[j, :n] = targets[matches, 1:]
+            out[..., 2:4] = out[..., 2:4].mul_(scale_tensor)
+        return out
+
+    def __call__(self, preds, batch):
+        """Calculate the sum of the loss for cls and loc multiplied by batch size."""
+        loss = torch.zeros(2, device=self.device)  # cls, loc
+        feats = preds[1] if isinstance(preds, tuple) else preds
+        pred_offsets, pred_scores = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2).split(
+            (self.reg_max * 2, self.nc), 1
+        )
+
+        pred_scores = pred_scores.permute(0, 2, 1).contiguous()
+        pred_offsets = pred_offsets.permute(0, 2, 1).contiguous()
+
+        dtype = pred_scores.dtype
+        batch_size = pred_scores.shape[0]
+        imgsz = torch.tensor(feats[0].shape[2:], device=self.device, dtype=dtype) * self.stride[0]
+        anchor_points, stride_tensor = make_anchors(feats=feats, strides=self.stride, grid_cell_offset=0)
+
+        targets = torch.cat(
+            (
+                batch["batch_idx"].view(-1, 1),
+                batch["cls"].view(-1, 1),
+                batch["radii"].view(-1, 1),
+                batch["locations"],
+            ),
+            1,
+        )
+        targets = self.preprocess(targets.to(self.device), batch_size, scale_tensor=imgsz[[1, 0]])
+        gt_labels, gt_radii, gt_locations = targets.split((1, 1, 2), 2)
+        mask_gt = gt_locations.sum(2, keepdim=True).gt_(0)
+
+        pred_locations = anchor_points.repeat(1, self.reg_max) + (pred_offsets.sigmoid() * 2 - 0.5)
+        anchors_min = anchor_points - 0.5
+        anchors_max = anchor_points + 1.5
+
+        _, target_locations, target_scores, fg_mask, _ = self.assigner(
+            pd_scores=pred_scores.detach().sigmoid(),
+            pd_locations=(pred_locations.detach() * stride_tensor).type(gt_locations.dtype),
+            anc_min=anchors_min * stride_tensor,
+            anc_max=anchors_max * stride_tensor,
+            gt_labels=gt_labels,
+            gt_radii=gt_radii,
+            gt_locations=gt_locations,
+            mask_gt=mask_gt,
+        )
+        target_scores_sum = max((target_scores).sum(), 1)
+
+        loss[1] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum  # cls loss
+        if fg_mask.sum():
+            target_locations /= stride_tensor
+            loss[0] = self.loc_loss(
+                pred_locations=pred_locations, target_locations=target_locations, fg_mask=fg_mask
+            )
+
+        loss[0] *= self.hyp.loc
+        loss[1] *= self.hyp.cls
+        assert not math.isnan(loss[0]) and not math.isnan(loss[1]), "Loss is nan!"
+
+        return loss.sum() * batch_size, loss.detach()
 
 
 class v8SegmentationLoss(v8DetectionLoss):
