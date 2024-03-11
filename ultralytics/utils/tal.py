@@ -474,7 +474,6 @@ class LocTaskAlignedAssigner(nn.Module):
         align_metric = loc_scores.pow(self.alpha) * dist_scores.pow(self.beta)
 
         return align_metric, dist_scores
-
     def select_topk_candidates(self, metrics, largest=True, topk_mask=None):
         """
         Select the top-k candidates based on the given metrics.
