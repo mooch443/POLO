@@ -2106,7 +2106,12 @@ class Format:
             labels["sem_masks"] = sem_masks.float()
         labels["img"] = self._format_img(img)
         labels["cls"] = torch.from_numpy(cls) if nl else torch.zeros(nl, 1)
-        labels["bboxes"] = torch.from_numpy(instances.bboxes) if nl else torch.zeros((nl, 4))
+        if instances.bboxes is not None:
+            labels["bboxes"] = torch.from_numpy(instances.bboxes) if nl else torch.zeros((nl, 4))
+        else:
+            labels["bboxes"] = torch.zeros((nl, 4))
+        if self.return_locations:
+            labels["locations"] = torch.from_numpy(instances.locations) if nl else torch.zeros((nl, 2))
         if self.return_keypoint:
             labels["keypoints"] = (
                 torch.empty(0, 3) if instances.keypoints is None else torch.from_numpy(instances.keypoints)
@@ -2480,6 +2485,31 @@ def v8_transforms(dataset, imgsz: int, hyp: IterableSimpleNamespace, stretch: bo
     )  # transforms
 
 
+def v8_transforms_loc(dataset, imgsz, hyp, stretch=False):
+    """Convert images to a size suitable for YOLOv8 training."""
+    pre_transform = Compose(
+        [
+            Mosaic(dataset, imgsz=imgsz, p=hyp.mosaic),
+            RandomPerspective(
+                degrees=hyp.degrees,
+                translate=hyp.translate,
+                scale=hyp.scale,
+                shear=hyp.shear,
+                perspective=hyp.perspective,
+                pre_transform=None if stretch else LetterBox(new_shape=(imgsz, imgsz)),
+            ),
+        ]
+    )
+
+    return Compose(
+        [
+            #pre_transform,
+            #MixUp(dataset, pre_transform=pre_transform, p=hyp.mixup),
+            #RandomHSV(hgain=hyp.hsv_h, sgain=hyp.hsv_s, vgain=hyp.hsv_v),
+            #RandomFlip(direction="vertical", p=hyp.flipud),
+            #RandomFlip(direction="horizontal", p=hyp.fliplr, flip_idx=None),
+        ]
+    )   # localization transforms
 # Classification augmentations -----------------------------------------------------------------------------------------
 def classify_transforms(
     size: tuple[int, int] | int = 224,
