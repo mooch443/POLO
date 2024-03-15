@@ -11,7 +11,7 @@ from ultralytics.engine.validator import BaseValidator
 from ultralytics.utils import LOGGER, ops
 from ultralytics.utils.checks import check_requirements
 from ultralytics.utils.metrics import ConfusionMatrix, LocMetrics, box_iou
-from ultralytics.utils.plotting import output_to_target, plot_images
+from ultralytics.utils.plotting import plot_images
 
 
 class LocalizationValidator(BaseValidator):
@@ -226,10 +226,7 @@ class LocalizationValidator(BaseValidator):
     def plot_val_samples(self, batch, ni):
         """Plot validation image samples."""
         plot_images(
-            batch["img"],
-            batch["batch_idx"],
-            batch["cls"].squeeze(-1),
-            batch["bboxes"],
+            labels=batch,
             paths=batch["im_file"],
             fname=self.save_dir / f"val_batch{ni}_labels.jpg",
             names=self.names,
@@ -238,13 +235,36 @@ class LocalizationValidator(BaseValidator):
 
     def plot_predictions(self, batch, preds, ni):
         """Plots predicted bounding boxes on input images and saves the result."""
+        if not preds:
+            return
+        max_det = self.args.max_det
+        batch_idx, cls, conf, bboxes = [], [], [], []
+        for i, pred in enumerate(preds):
+            if pred is None or not len(pred):
+                continue
+            pred = pred[:max_det]
+            batch_idx.append(torch.full((len(pred),), i, device=pred.device))
+            bboxes.append(pred[:, :4])
+            conf.append(pred[:, 4])
+            cls.append(pred[:, 5])
+
+        if not batch_idx:
+            return
+
+        batched_preds = {
+            "batch_idx": torch.cat(batch_idx),
+            "cls": torch.cat(cls),
+            "bboxes": ops.xyxy2xywh(torch.cat(bboxes)),
+            "conf": torch.cat(conf),
+        }
         plot_images(
-            batch["img"],
-            *output_to_target(preds, max_det=self.args.max_det),
+            labels=batched_preds,
+            images=batch["img"],
             paths=batch["im_file"],
             fname=self.save_dir / f"val_batch{ni}_pred.jpg",
             names=self.names,
             on_plot=self.on_plot,
+            conf_thres=self.args.conf,
         )  # pred
 
     def save_one_txt(self, predn, save_conf, shape, file):
