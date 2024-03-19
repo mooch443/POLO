@@ -2,6 +2,12 @@
 
 from __future__ import annotations
 
+# DEBUG 
+import sys
+sys.path.append("/home/giacomo/projects/P0_YOLOcate")
+
+from P0_tests.playground import *
+
 import contextlib
 import math
 import re
