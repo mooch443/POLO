@@ -50,8 +50,10 @@ dropout: 0.0 # (float) dropout for classification head (classify only)
 val: True # (bool) run validation/testing during training
 split: val # (str) dataset split to evaluate: 'val', 'test' or 'train'
 save_json: False # (bool) save results to COCO JSON for external evaluation
+save_hybrid: False # (bool) save hybrid version of labels (labels + additional predictions)
 conf: # (float, optional) confidence threshold; defaults: predict=0.25, val=0.001
 iou: 0.7 # (float) IoU threshold used for NMS
+dor: 0.3 # (float) distance over radius (DoR) threshold for NMS
 max_det: 300 # (int) maximum number of detections per image
 half: False # (bool) use half precision (FP16) if supported
 dnn: False # (bool) use OpenCV DNN for ONNX inference
