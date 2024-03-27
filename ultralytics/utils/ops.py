@@ -169,8 +169,6 @@ def scale_locations(img1_shape, locations, img0_shape, ratio_pad=None, padding=T
     locations[..., :2] /= gain
     return clip_locations(locations, img0_shape)
 
-
-
 def make_divisible(x: int, divisor):
     """Return the nearest number that is divisible by the given divisor.
 
@@ -483,7 +481,7 @@ def non_max_suppression_loc(
         c = x[:, 3:4] * (0 if agnostic else cls_offset)  # classes
         # as seen on https://stackoverflow.com/questions/73650652/how-to-apply-function-element-wise-to-2d-tensor
         radii_np = np.vectorize(lambda x: radii[x])(x[:, 3:4].cpu())
-        radii_t = torch.from_numpy(radii_np).to(locs.device)
+        radii_t = torch.from_numpy(radii_np).to(x.device)
         scores = x[:, 2]  # scores
         locs = x[:, :2] + c  # locations (offset by class)
         i = loc_nms(locs, scores, radii_t, dor_thres)  # NMS
@@ -954,7 +952,6 @@ def scale_coords(img1_shape, coords, img0_shape, ratio_pad=None, normalize: bool
         coords[..., 0] /= img0_w  # width
         coords[..., 1] /= img0_h  # height
     return coords
-
 
 def regularize_rboxes(rboxes):
     """Regularize rotated bounding boxes to range [0, pi/2].

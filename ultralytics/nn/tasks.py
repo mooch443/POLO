@@ -543,6 +543,13 @@ class LocalizationModel(BaseModel):
         """Localization models do not support augmented prediction."""
         raise NotImplementedError("Augmented prediction not implemented for localization models.")
 
+    @staticmethod
+    def _descale_pred(p, flips, scale, img_size, dim=1):
+        raise NotImplementedError("Augmented prediction not implemented for localization models.")
+
+    def _clip_augmented(self, y):
+        raise NotImplementedError("Augmented prediction not implemented for localization models.")
+
     def init_criterion(self):
         """Initialize the loss criterion for the LocalizationModel."""
         return v8LocalizationLoss(self)
