@@ -360,14 +360,21 @@ class Annotator:
                     lineType=cv2.LINE_AA,
                 )
 
-    def loc_label(self, loc, label: str = "", color: tuple = (128, 128, 128), txt_color: tuple = (255, 255, 255)):
+    def loc_label(
+        self,
+        loc,
+        label: str = "",
+        color: tuple = (128, 128, 128),
+        txt_color: tuple = (255, 255, 255),
+        loc_radius: int = 4,
+    ):
         """Draw a location marker on an image with a given label."""
         txt_color = self.get_txt_color(color, txt_color)
         if isinstance(loc, torch.Tensor):
             loc = loc.tolist()
         if self.pil or not is_ascii(label):
-            bbox_tl = (loc[0] - 4, loc[1] - 4)
-            bbox_br = (loc[0] + 4, loc[1] + 4)
+            bbox_tl = (loc[0] - loc_radius, loc[1] - loc_radius)
+            bbox_br = (loc[0] + loc_radius, loc[1] + loc_radius)
             self.draw.ellipse([bbox_tl, bbox_br], width=self.lw, outline=color)
             if label:
                 w, h = self.font.getsize(label)  # text width, height
@@ -391,14 +398,14 @@ class Annotator:
             cv2.circle(
                 self.im,
                 center=(int(loc[0]), int(loc[1])),
-                radius=4,
+                radius=loc_radius,
                 color=color,
                 thickness=self.lw,
                 lineType=cv2.LINE_AA,
             )
             if label:
                 w, h = cv2.getTextSize(label, 0, fontScale=self.sf, thickness=self.tf)[0]
-                p1 = [int(loc[0] - 4), int(loc[1] - 4)]
+                p1 = [int(loc[0] - loc_radius), int(loc[1] - loc_radius)]
                 outside = p1[1] - h >= 3
                 p2 = p1[0] + w, p1[1] - h - 3 if outside else p1[1] + h + 3
                 cv2.rectangle(self.im, p1, p2, color, -1, cv2.LINE_AA)
