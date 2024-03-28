@@ -566,11 +566,11 @@ class Results(SimpleClass, DataExportMixin):
 
         # Plot Localization results
         if pred_locs is not None and show_locs:
-            for d in reversed(pred_locs):
-                c, conf, id = int(d.cls), float(d.conf) if conf else None, None if d.id is None else int(d.id.item())
+            for l in reversed(pred_locs):
+                c, conf, id = int(l.cls), float(l.conf) if conf else None, None if l.id is None else int(l.id.item())
                 name = ("" if id is None else f"id:{id} ") + names[c]
                 label = (f"{name} {conf:.2f}" if conf else name) if labels else None
-                loc = d.xy
+                loc = l.xy
                 annotator.loc_label(loc, label, color=colors(c, True), loc_radius=loc_radius)
         # Plot Classify results
         if pred_probs is not None and show_probs:
@@ -668,12 +668,14 @@ class Results(SimpleClass, DataExportMixin):
             - The returned string is comma-separated and ends with a comma and a space.
         """
         boxes = self.obb if self.obb is not None else self.boxes
+        locs = self.locations
         if len(self) == 0:
             return "" if self.probs is not None else "(no detections), "
         if self.probs is not None:
             return f"{', '.join(f'{self.names[j]} {self.probs.data[j]:.2f}' for j in self.probs.top5)}, "
-        if boxes:
-            counts = boxes.cls.int().bincount()
+        if boxes or locs:
+            detections = boxes if boxes is not None else locs
+            counts = detections.cls.int().bincount()
             return "".join(f"{n} {self.names[i]}{'s' * (n > 1)}, " for i, n in enumerate(counts) if n > 0)
 
     def save_txt(self, txt_file: str | Path, save_conf: bool = False) -> str:
@@ -728,7 +730,7 @@ class Results(SimpleClass, DataExportMixin):
         elif locs:
             # Locate
             for d in locs:
-                c, conf, id = int(d.cls), float(d.conf), int(d.id.item()) if d.is_track else None
+                c, conf, id = int(d.cls), float(d.conf), None if d.id is None else int(d.id.item())
                 line = (c, *d.xyn.view(-1))
                 line += (conf,) * save_conf + (() if id is None else (id,))
                 texts.append(("%g " * len(line)).rstrip() % line)
@@ -766,6 +768,9 @@ class Results(SimpleClass, DataExportMixin):
             return
         if self.obb is not None:
             LOGGER.warning("OBB task does not support `save_crop`.")
+            return
+        if self.locations is not None:
+            LOGGER.warning("Localization task does not support `save_crop`.")
             return
         for d in self.boxes:
             save_one_box(
@@ -813,37 +818,52 @@ class Results(SimpleClass, DataExportMixin):
                 )
             return results
 
+        h, w = self.orig_shape if normalize else (1, 1)
+
         is_obb = self.obb is not None
         data = self.obb if is_obb else self.boxes
-        h, w = self.orig_shape if normalize else (1, 1)
-        for i, row in enumerate(data):  # xyxy, track_id if tracking, conf, class_id
-            class_id, conf = int(row.cls), round(row.conf.item(), decimals)
-            box = (row.xyxyxyxy if is_obb else row.xyxy).squeeze().reshape(-1, 2).tolist()
-            xy = {}
-            for j, b in enumerate(box):
-                xy[f"x{j + 1}"] = round(b[0] / w, decimals)
-                xy[f"y{j + 1}"] = round(b[1] / h, decimals)
-            result = {"name": self.names[class_id], "class": class_id, "confidence": conf, "box": xy}
-            if data.is_track:
-                result["track_id"] = int(row.id.item())  # track ID
-            if self.masks:
-                result["segments"] = {
-                    "x": (self.masks.xy[i][:, 0] / w).round(decimals).tolist(),
-                    "y": (self.masks.xy[i][:, 1] / h).round(decimals).tolist(),
-                }
-            if self.keypoints is not None:
-                kpt = self.keypoints[i]
-                if kpt.has_visible:
-                    x, y, visible = kpt.data[0].cpu().unbind(dim=1)
-                else:
-                    x, y = kpt.data[0].cpu().unbind(dim=1)
-                result["keypoints"] = {
-                    "x": (x / w).numpy().round(decimals).tolist(),
-                    "y": (y / h).numpy().round(decimals).tolist(),
-                }
-                if kpt.has_visible:
-                    result["keypoints"]["visible"] = visible.numpy().round(decimals).tolist()
-            results.append(result)
+        if data is not None:
+            for i, row in enumerate(data):  # xyxy, track_id if tracking, conf, class_id
+                class_id, conf = int(row.cls), round(row.conf.item(), decimals)
+                box = (row.xyxyxyxy if is_obb else row.xyxy).squeeze().reshape(-1, 2).tolist()
+                xy = {}
+                for j, b in enumerate(box):
+                    xy[f"x{j + 1}"] = round(b[0] / w, decimals)
+                    xy[f"y{j + 1}"] = round(b[1] / h, decimals)
+                result = {"name": self.names[class_id], "class": class_id, "confidence": conf, "box": xy}
+                if data.is_track:
+                    result["track_id"] = int(row.id.item())  # track ID
+                if self.masks:
+                    result["segments"] = {
+                        "x": (self.masks.xy[i][:, 0] / w).round(decimals).tolist(),
+                        "y": (self.masks.xy[i][:, 1] / h).round(decimals).tolist(),
+                    }
+                if self.keypoints is not None:
+                    kpt = self.keypoints[i]
+                    if kpt.has_visible:
+                        x, y, visible = kpt.data[0].cpu().unbind(dim=1)
+                    else:
+                        x, y = kpt.data[0].cpu().unbind(dim=1)
+                    result["keypoints"] = {
+                        "x": (x / w).numpy().round(decimals).tolist(),
+                        "y": (y / h).numpy().round(decimals).tolist(),
+                    }
+                    if kpt.has_visible:
+                        result["keypoints"]["visible"] = visible.numpy().round(decimals).tolist()
+                results.append(result)
+            return results
+
+        if self.locations is not None:
+            for row in self.locations:
+                class_id, conf = int(row.cls), round(row.conf.item(), decimals)
+                loc = row.xy.squeeze()
+                if isinstance(loc, torch.Tensor):
+                    loc = loc.tolist()
+                location = {"x": round(loc[0] / w, decimals), "y": round(loc[1] / h, decimals)}
+                result = {"name": self.names[class_id], "class": class_id, "confidence": conf, "location": location}
+                if row.id is not None:
+                    result["track_id"] = int(row.id.item())
+                results.append(result)
 
         return results
 
