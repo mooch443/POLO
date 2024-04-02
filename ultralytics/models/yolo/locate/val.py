@@ -85,10 +85,10 @@ class LocalizationValidator(BaseValidator):
     def postprocess(self, preds):
         """Apply Non-maximum suppression to prediction outputs."""
         return ops.non_max_suppression_loc(
-            preds,
-            self.args.conf,
-            self.args.dor,
-            self.radii,
+            prediction=preds,
+            conf_thres=self.args.conf,
+            dor_thres=self.args.dor,
+            radii=self.radii,
             labels=self.lb,
             multi_label=True,
             agnostic=self.args.single_cls,
@@ -122,7 +122,7 @@ class LocalizationValidator(BaseValidator):
             stat = dict(
                 conf=torch.zeros(0, device=self.device),
                 pred_cls=torch.zeros(0, device=self.device),
-                tp=torch.zeros(npr, self.niou, dtype=torch.bool, device=self.device),
+                tp=torch.zeros(npr, self.ndor, dtype=torch.bool, device=self.device),
             )
             pbatch = self._prepare_batch(si, batch)
             cls, location = pbatch.pop("cls"), pbatch.pop("location")
@@ -133,7 +133,10 @@ class LocalizationValidator(BaseValidator):
                     for k in self.stats.keys():
                         self.stats[k].append(stat[k])
                     if self.args.plots:
-                        self.confusion_matrix.process_batch_loc(detections=None, gt_locs=location, gt_cls=cls)
+                        radii_t = ops.generate_radii_t(radii=self.radii, cls=cls)
+                        self.confusion_matrix.process_batch_loc(
+                            localizations=None, gt_locs=location, gt_cls=cls, radii=radii_t
+                        )
                 continue
 
             # Predictions
@@ -147,7 +150,10 @@ class LocalizationValidator(BaseValidator):
             if nl:
                 stat["tp"] = self._process_batch(predn, location, cls)
                 if self.args.plots:
-                    self.confusion_matrix.process_batch_loc(predn, location, cls)
+                    radii_t = ops.generate_radii_t(radii=self.radii, cls=cls)
+                    self.confusion_matrix.process_batch_loc(
+                        localizations=predn, gt_locs=location, gt_cls=cls, radii=radii_t
+                    )
             for k in self.stats.keys():
                 self.stats[k].append(stat[k])
 
@@ -193,9 +199,9 @@ class LocalizationValidator(BaseValidator):
 
     def _process_batch(self, detections, gt_locations, gt_cls):
         """Return correct prediction matrix."""
-        gt_radii = torch.tensor([self.radii[int(c)] for c in gt_cls], device=gt_locations.device).view(-1, 1)
-        dor = loc_dor_pw(gt_locations, detections[:, :2], gt_radii)
-        return self.match_predictions_loc(detections[:, 3], gt_cls, dor)
+        gt_radii = ops.generate_radii_t(radii=self.radii, cls=gt_cls).view(-1, 1)
+        dor = loc_dor_pw(loc1=gt_locations, loc2=detections[:, :2], radii=gt_radii)
+        return self.match_predictions_loc(pred_classes=detections[:, 3], true_classes=gt_cls, dor=dor)
 
     def build_dataset(self, img_path, mode="val", batch=None):
         """

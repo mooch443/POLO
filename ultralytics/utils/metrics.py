@@ -488,7 +488,7 @@ class ConfusionMatrix(DataExportMixin):
             return
 
         gt_classes = gt_cls.int()
-        location_classes = localizations[:, 3].int()
+        localization_classes = localizations[:, 3].int()
         dor = loc_dor_pw(loc1=gt_locs, loc2=localizations[:, :2], radii=radii)
 
 
