@@ -454,7 +454,8 @@ class LocTaskAlignedAssigner(nn.Module):
         return mask_pos, align_metric, dist_scores
 
     def get_loc_metrics(self, pd_scores, pd_locations, gt_labels, gt_radii, gt_locations, mask_gt):
-        """Compute alignment metric given predicted and ground truth locations."""
+        """Compute alignment metric given predicted and ground truth locations. Currently this cannot handle
+        more than one prediction per cell."""
         na = pd_locations.shape[-2]
         mask_gt = mask_gt.bool()  # b, max_num_obj, h*w
         dist_scores = torch.zeros([self.bs, self.n_max_locs, na], dtype=pd_locations.dtype, device=pd_locations.device)

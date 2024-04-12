@@ -549,6 +549,8 @@ class v8LocalizationLoss:
             loss[0] = self.loc_loss(
                 pred_locations=pred_locations, target_locations=target_locations, fg_mask=fg_mask
             )
+            target_locations /= stride_tensor
+            loss[0] = self.loc_loss(pred_locations=pred_locations, target_locations=target_locations, fg_mask=fg_mask)
 
         loss[0] *= self.hyp.loc
         loss[1] *= self.hyp.cls
