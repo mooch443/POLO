@@ -504,8 +504,7 @@ class v8LocalizationLoss:
         loss = torch.zeros(2, device=self.device)  # cls, loc
         feats = preds[1] if isinstance(preds, tuple) else preds
         pred_offsets, pred_scores = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2).split(
-            (self.reg_max * 2, self.nc), 1
-        )
+            (self.reg_max * 2, self.nc), 1)
 
         pred_scores = pred_scores.permute(0, 2, 1).contiguous()
         pred_offsets = pred_offsets.permute(0, 2, 1).contiguous()
