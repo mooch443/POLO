@@ -556,7 +556,6 @@ class v8LocalizationLoss:
 
         return loss.sum() * batch_size, loss.detach()
 
-
 class v8SegmentationLoss(v8DetectionLoss):
     """Criterion class for computing training losses for YOLOv8 segmentation."""
 

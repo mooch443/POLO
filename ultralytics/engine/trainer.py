@@ -23,6 +23,7 @@ import numpy as np
 import torch
 from torch import distributed as dist
 from torch import nn, optim
+from torch import functional as F
 
 from ultralytics import __version__
 from ultralytics.cfg import get_cfg, get_save_dir
@@ -421,7 +422,7 @@ class BaseTrainer:
                         )
                         if "momentum" in x:
                             x["momentum"] = np.interp(ni, xi, [self.args.warmup_momentum, self.args.momentum])
-
+                
                 # Forward
                 with autocast(self.amp):
                     batch = self.preprocess_batch(batch)
