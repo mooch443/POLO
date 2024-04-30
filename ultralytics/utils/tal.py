@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.functional as F 
 
 from . import LOGGER
 from .metrics import bbox_iou, loc_dor, probiou
