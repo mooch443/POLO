@@ -315,6 +315,7 @@ class BaseValidator:
                         matches = matches[np.unique(matches[:, 1], return_index=True)[1]]
                         matches = matches[np.unique(matches[:, 0], return_index=True)[1]]
                     correct[matches[:, 1].astype(int), i] = True
+
         return torch.tensor(correct, dtype=torch.bool, device=pred_classes.device)
     
     def match_predictions_loc(self, pred_classes, true_classes, dor, use_scipy=False):
@@ -341,14 +342,14 @@ class BaseValidator:
                 # WARNING: known issue that reduces mAP in https://github.com/ultralytics/ultralytics/pull/4708
                 import scipy  # scope import to avoid importing for all commands
 
-                cost_matrix = dor * (dor >= threshold)
+                cost_matrix = dor * (dor <= threshold)
                 if cost_matrix.any():
                     labels_idx, detections_idx = scipy.optimize.linear_sum_assignment(cost_matrix, maximize=True)
                     valid = cost_matrix[labels_idx, detections_idx] > 0
                     if valid.any():
                         correct[detections_idx[valid], i] = True
             else:
-                matches = np.nonzero(dor >= threshold)  # DoR > threshold and classes match
+                matches = np.nonzero((dor <= threshold) & (dor > 0))  # DoR < threshold and classes match
                 matches = np.array(matches).T
                 if matches.shape[0]:
                     if matches.shape[0] > 1:
@@ -357,6 +358,7 @@ class BaseValidator:
                         # matches = matches[matches[:, 2].argsort()[::-1]]
                         matches = matches[np.unique(matches[:, 0], return_index=True)[1]]
                     correct[matches[:, 1].astype(int), i] = True
+
         return torch.tensor(correct, dtype=torch.bool, device=pred_classes.device)
 
     def add_callback(self, event: str, callback):
