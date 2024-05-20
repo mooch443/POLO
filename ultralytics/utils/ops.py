@@ -1035,7 +1035,7 @@ def empty_like(x):
     return torch.empty_like(x, dtype=x.dtype) if isinstance(x, torch.Tensor) else np.empty_like(x, dtype=x.dtype)
 
 
-def generate_radii_t(radii, cls):
+def generate_radii_t(radii: dict, cls: torch.Tensor):
     """
     For a tensor of class labels, generate a tensor of the same dimensions containing each class radius value.
     As seen on https://stackoverflow.com/questions/73650652/how-to-apply-function-element-wise-to-2d-tensor
