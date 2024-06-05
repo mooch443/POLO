@@ -467,6 +467,7 @@ class ConfusionMatrix(DataExportMixin):
             gt_cls (Array[M]): The class labels.
             radii (Array[M, 1]): Radii for DoR calculation per ground-truth instance.
         """
+
         if gt_cls.shape[0] == 0:  # Check if labels is empty
             if localizations is not None:
                 localizations = localizations[localizations[:, 2] > self.conf]
@@ -515,6 +516,7 @@ class ConfusionMatrix(DataExportMixin):
             for i, lc in enumerate(localization_classes):
                 if not any(m1 == i):
                     self.matrix[lc, self.nc] += 1  # predicted background
+
 
     def matrix(self):
         """Return the confusion matrix."""
