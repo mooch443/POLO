@@ -30,11 +30,18 @@ class LocalizationValidator(BaseValidator):
 
     def __init__(self, dataloader=None, save_dir=None, pbar=None, args=None, _callbacks=None):
         """Initialize detection model with necessary variables and settings."""
+        if "radii" in args.keys():
+            radii = args.pop("radii")
+        else:
+            radii = None
+
         super().__init__(dataloader, save_dir, pbar, args, _callbacks)
         self.nt_per_class = None
         self.is_coco = False
         self.class_map = None
+
         self.args.task = "locate"
+        self.radii = radii if radii is not None else self.data["radii"]
         self.metrics = LocMetrics(save_dir=self.save_dir, on_plot=self.on_plot)
         self.dorv = torch.linspace(1.0, 0.1, 10)  # dor vector for mAP@1:0.1
         self.ndor = self.dorv.numel()
@@ -87,7 +94,7 @@ class LocalizationValidator(BaseValidator):
             prediction=preds,
             conf_thres=self.args.conf,
             dor_thres=self.args.dor,
-            radii=self.data["radii"],
+            radii=self.radii,
             labels=self.lb,
             multi_label=True,
             agnostic=self.args.single_cls,
