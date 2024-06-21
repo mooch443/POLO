@@ -135,7 +135,7 @@ def scale_boxes(img1_shape, boxes, img0_shape, ratio_pad=None, padding: bool = T
     boxes[..., :4] /= gain
     return boxes if xywh else clip_boxes(boxes, img0_shape)
 
-def scale_locations(img1_shape, locations, img0_shape, ratio_pad=None, padding=True):
+def scale_locations(img1_shape, locations, img0_shape, ratio_pad=None, padding=True, remove_clipped: bool = True):
     """
     Rescales locations from the shape of the image they were originally specified in (img1_shape) 
     to the shape of a different image (img0_shape).
@@ -148,6 +148,7 @@ def scale_locations(img1_shape, locations, img0_shape, ratio_pad=None, padding=T
             calculated based on the size difference between the two images.
         padding (bool): If True, assuming the locations are based on image augmented by yolo style. If False then do regular
             rescaling.
+        remove_clipped (boolean): if True, locations that lie outside of the shape are removed, not clipped
 
     Returns:
         locations (torch.Tensor): The scaled locations
@@ -167,7 +168,7 @@ def scale_locations(img1_shape, locations, img0_shape, ratio_pad=None, padding=T
         locations[..., 1] -= pad[1]  # y padding
 
     locations[..., :2] /= gain
-    return clip_locations(locations, img0_shape, remove_clipped=True)
+    return clip_locations(locations, img0_shape, remove_clipped=remove_clipped)
 
 def make_divisible(x: int, divisor):
     """Return the nearest number that is divisible by the given divisor.
