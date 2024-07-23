@@ -1041,5 +1041,7 @@ def generate_radii_t(radii: dict, cls: torch.Tensor):
     For a tensor of class labels, generate a tensor of the same dimensions containing each class radius value.
     As seen on https://stackoverflow.com/questions/73650652/how-to-apply-function-element-wise-to-2d-tensor
     """
+    if cls.numel() == 0:
+        return torch.empty(0)
     radii_np = np.vectorize(lambda x: radii[x])(cls.cpu())
     return torch.from_numpy(radii_np).to(cls.device)
