@@ -339,7 +339,7 @@ class ConfusionMatrix(DataExportMixin):
         self.matches = {} if save_matches else None
         self.conf = 0.25 if conf in (None, 0.001) else conf  # apply 0.25 if default val conf is passed
         self.iou_thres = iou_thres
-        self.dor_thres = dor_thresh
+        self.dor_thres = 1.0 if dor_thresh is None else dor_thresh
 
     def _append_matches(self, mtype: str, batch: dict[str, Any], idx: int) -> None:
         """Append the matches to TP, FP, FN or GT list for the last batch.
@@ -467,7 +467,8 @@ class ConfusionMatrix(DataExportMixin):
             gt_cls (Array[M]): The class labels.
             radii (Array[M, 1]): Radii for DoR calculation per ground-truth instance.
         """
-        I will change sth here
+        assert len(gt_cls.shape) == 1
+
         if gt_cls.shape[0] == 0:  # Check if labels is empty
             if localizations is not None:
                 localizations = localizations[localizations[:, 2] > self.conf]
