@@ -1801,7 +1801,7 @@ def guess_model_scale(model_path):
         (str): The size character of the model's scale (n, s, m, l, or x).
     """
     try:
-        return re.search(r"yolo(e-)?[v]?\d+([nslmx])", Path(model_path).stem).group(2)
+        return re.search(r"(?:yolo(?:e-)?|polo)v?\d+([nslmx])", Path(model_path).stem).group(1)
     except AttributeError:
         return ""
 
@@ -1869,7 +1869,7 @@ def guess_model_task(model):
             return "pose"
         elif "-obb" in model.stem or "obb" in model.parts:
             return "obb"
-        elif "-loc" in model.stem or "locate" in model.parts:
+        elif "-loc" in model.stem or "polo" in model.stem or "locate" in model.parts:
             return "locate"
         elif "detect" in model.parts:
             return "detect"
