@@ -488,7 +488,6 @@ class ConfusionMatrix(DataExportMixin):
             for gc in gt_classes:
                 self.matrix[self.nc, gc] += 1  # background FN
             return
-
         gt_classes = gt_cls.int()
         localization_classes = localizations[:, 3].int()
         dor = loc_dor_pw(loc1=gt_locs, loc2=localizations[:, :2], radii=radii)
