@@ -410,13 +410,17 @@ class Instances:
         if self.keypoints is not None:
             self.keypoints[..., 0] = w - self.keypoints[..., 0]
 
-    def clip(self, w: int, h: int) -> None:
+    def clip(self, w: int, h: int) -> np.ndarray | None:
         """Clip coordinates to stay within image boundaries.
 
         Args:
             w (int): Image width.
             h (int): Image height.
+
+        Returns:
+            (np.ndarray | None): Mask of kept locations when locations are present, else None.
         """
+        good = None
         if self._bboxes is not None:
             ori_format = self._bboxes.format
             self.convert_bbox(format="xyxy")
@@ -425,8 +429,13 @@ class Instances:
             if ori_format != "xyxy":
                 self.convert_bbox(format=ori_format)
         if self.locations is not None:
-            self.locations[:, 0] = self.locations[:, 0].clip(0, w)
-            self.locations[:, 1] = self.locations[:, 1].clip(0, h)
+            good = (
+                (self.locations[:, 0] > 0)
+                & (self.locations[:, 0] < w)
+                & (self.locations[:, 1] > 0)
+                & (self.locations[:, 1] < h)
+            )
+            self.locations = self.locations[good]
         if self.segments is not None:
             self.segments[..., 0] = self.segments[..., 0].clip(0, w)
             self.segments[..., 1] = self.segments[..., 1].clip(0, h)
@@ -440,6 +449,7 @@ class Instances:
             ] = 0.0
             self.keypoints[..., 0] = self.keypoints[..., 0].clip(0, w)
             self.keypoints[..., 1] = self.keypoints[..., 1].clip(0, h)
+        return good
 
     def remove_zero_area_boxes(self) -> np.ndarray:
         """Remove zero-area boxes, i.e. after clipping some boxes may have zero width or height.

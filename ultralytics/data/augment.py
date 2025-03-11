@@ -797,8 +797,15 @@ class Mosaic(BaseMixTransform):
             return {}
         cls = []
         instances = []
+
+        # add radii to final labels if task is locate
+        if self.dataset.use_locations:
+            radii = []
+
         imgsz = self.imgsz * 2  # mosaic imgsz
         for labels in mosaic_labels:
+            if self.dataset.use_locations:
+                radii.append(labels["radii"])
             cls.append(labels["cls"])
             instances.append(labels["instances"])
         # Final labels
@@ -810,9 +817,17 @@ class Mosaic(BaseMixTransform):
             "instances": Instances.concatenate(instances, axis=0),
             "mosaic_border": self.border,
         }
-        final_labels["instances"].clip(imgsz, imgsz)
-        good = final_labels["instances"].remove_zero_area_boxes()
-        final_labels["cls"] = final_labels["cls"][good]
+        if self.dataset.use_locations:
+            final_labels["radii"] = np.concatenate(radii, 0)
+            good = final_labels["instances"].clip(imgsz, imgsz)
+            if good is None:
+                good = np.ones(len(final_labels["cls"]), dtype=bool)
+            final_labels["cls"] = final_labels["cls"][good]
+            final_labels["radii"] = final_labels["radii"][good]
+        else:
+            final_labels["instances"].clip(imgsz, imgsz)
+            good = final_labels["instances"].remove_zero_area_boxes()
+            final_labels["cls"] = final_labels["cls"][good]
         if "texts" in mosaic_labels[0]:
             final_labels["texts"] = mosaic_labels[0]["texts"]
         return final_labels
@@ -1298,13 +1313,22 @@ class RandomPerspective:
 
         segments = instances.segments
         keypoints = instances.keypoints
+        locations = instances.locations
         # Update bboxes if there are segments.
         if len(segments):
             bboxes, segments = self.apply_segments(segments, M)
-
+        if locations is not None:
+            locations = self.apply_locations(locations, M)
         if keypoints is not None:
             keypoints = self.apply_keypoints(keypoints, M)
-        new_instances = Instances(bboxes, segments, keypoints, bbox_format="xyxy", normalized=False)
+        new_instances = Instances(
+            bboxes=bboxes,
+            locations=locations,
+            segments=segments,
+            keypoints=keypoints,
+            bbox_format="xyxy",
+            normalized=False,
+        )
         # Clip
         new_instances.clip(*self.size)
 
@@ -2491,21 +2515,21 @@ def v8_transforms_loc(dataset, imgsz, hyp, stretch=False):
     """Convert images to a size suitable for YOLOv8 training."""
     pre_transform = Compose(
         [
-            Mosaic(dataset, imgsz=imgsz, p=hyp.mosaic),
-            RandomPerspective(
-                degrees=hyp.degrees,
-                translate=hyp.translate,
-                scale=hyp.scale,
-                shear=hyp.shear,
-                perspective=hyp.perspective,
-                pre_transform=None if stretch else LetterBox(new_shape=(imgsz, imgsz)),
-            ),
+            Mosaic(dataset, imgsz=imgsz, p=hyp.mosaic)#,
+            #RandomPerspective(
+            #    degrees=hyp.degrees,
+            #    translate=hyp.translate,
+            #    scale=hyp.scale,
+            #    shear=hyp.shear,
+            #    perspective=hyp.perspective,
+            #    pre_transform=None if stretch else LetterBox(new_shape=(imgsz, imgsz)),
+           # ),
         ]
     )
 
     return Compose(
         [
-            #pre_transform,
+            pre_transform,
             #MixUp(dataset, pre_transform=pre_transform, p=hyp.mixup),
             #RandomHSV(hgain=hyp.hsv_h, sgain=hyp.hsv_s, vgain=hyp.hsv_v),
             #RandomFlip(direction="vertical", p=hyp.flipud),
