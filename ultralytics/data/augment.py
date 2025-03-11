@@ -888,6 +888,10 @@ class MixUp(BaseMixTransform):
         labels["img"] = (labels["img"] * r + labels2["img"] * (1 - r)).astype(np.uint8)
         labels["instances"] = Instances.concatenate([labels["instances"], labels2["instances"]], axis=0)
         labels["cls"] = np.concatenate([labels["cls"], labels2["cls"]], 0)
+
+        if self.dataset.use_locations:
+            labels["radii"] = np.concatenate([labels["radii"], labels2["radii"]], 0)
+
         return labels
 
 
@@ -2530,7 +2534,7 @@ def v8_transforms_loc(dataset, imgsz, hyp, stretch=False):
     return Compose(
         [
             pre_transform,
-            #MixUp(dataset, pre_transform=pre_transform, p=hyp.mixup),
+            MixUp(dataset, pre_transform=pre_transform, p=hyp.mixup),
             #RandomHSV(hgain=hyp.hsv_h, sgain=hyp.hsv_s, vgain=hyp.hsv_v),
             #RandomFlip(direction="vertical", p=hyp.flipud),
             #RandomFlip(direction="horizontal", p=hyp.fliplr, flip_idx=None),
