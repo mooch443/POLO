@@ -1868,6 +1868,7 @@ class Albumentations:
         """
         self.p = p
         self.transform = None
+        self.use_locations = use_locations
         prefix = colorstr("albumentations: ")
 
         try:
@@ -2523,21 +2524,22 @@ def v8_transforms_loc(dataset, imgsz, hyp, stretch=False):
     """Convert images to a size suitable for YOLOv8 training."""
     pre_transform = Compose(
         [
-            Mosaic(dataset, imgsz=imgsz, p=hyp.mosaic),
-            RandomPerspective(
-                degrees=hyp.degrees,
-                translate=hyp.translate,
-                scale=hyp.scale,
-                shear=hyp.shear,
-                perspective=hyp.perspective,
-                pre_transform=None if stretch else LetterBox(new_shape=(imgsz, imgsz)),
-            ),
+            #Mosaic(dataset, imgsz=imgsz, p=hyp.mosaic),
+            #RandomPerspective(
+            #    degrees=hyp.degrees,
+            #    translate=hyp.translate,
+            #    scale=hyp.scale,
+            #    shear=hyp.shear,
+            #    perspective=hyp.perspective,
+            #   pre_transform=None if stretch else LetterBox(new_shape=(imgsz, imgsz)),
+            #),
         ]
     )
 
     return Compose(
         [
-            pre_transform,
+            #pre_transform,
+            Albumentations(p=1.0, use_locations=True),
             #MixUp(dataset, pre_transform=pre_transform, p=hyp.mixup),
             #RandomHSV(hgain=hyp.hsv_h, sgain=hyp.hsv_s, vgain=hyp.hsv_v),
             #RandomFlip(direction="vertical", p=hyp.flipud),
