@@ -368,7 +368,7 @@ def loc_nms(
     N = locs.size(0)
 
     suppressed = torch.zeros(N, dtype=torch.bool, device=device)
-    keep_mask  = torch.zeros(N, dtype=torch.bool, device=device)
+    keep_mask = torch.zeros(N, dtype=torch.bool, device=device)
     cols = torch.arange(N, device=device)
 
     for i0 in range(0, N, block):
