@@ -16,6 +16,8 @@ import torchvision
 from ultralytics.utils import LOGGER, NOT_MACOS14
 from ultralytics.utils.metrics import batch_probiou, loc_dor_pw
 
+from typing import Mapping, Optional
+
 # test
 
 class Profile(contextlib.ContextDecorator):
@@ -1038,13 +1040,41 @@ def empty_like(x):
     """Create empty torch.Tensor or np.ndarray with same shape as input and float32 dtype."""
     return torch.empty_like(x, dtype=x.dtype) if isinstance(x, torch.Tensor) else np.empty_like(x, dtype=x.dtype)
 
-
-def generate_radii_t(radii: dict, cls: torch.Tensor):
+@torch.no_grad()
+def generate_radii_t(
+    radii: Mapping[int, float],
+    cls: torch.Tensor,
+    default: float = 20.0,
+    dtype: Optional[torch.dtype] = None,
+) -> torch.Tensor:
     """
-    For a tensor of class labels, generate a tensor of the same dimensions containing each class radius value.
-    As seen on https://stackoverflow.com/questions/73650652/how-to-apply-function-element-wise-to-2d-tensor
+    Map integer class labels in `cls` to per-class radii on the same device.
+    Works during training (no CPU<->GPU roundtrips), differentiability not needed.
+
+    radii: dict {class_id:int -> radius:float}
+    cls:   int tensor of any shape on any device
+    default: radius used for unknown labels
     """
     if cls.numel() == 0:
-        return torch.empty(0)
-    radii_np = np.vectorize(lambda x: radii[x])(cls.cpu())
-    return torch.from_numpy(radii_np).to(cls.device)
+        return cls.new_empty(cls.shape, dtype=dtype or torch.float32)
+
+    device = cls.device
+    dtype = dtype or torch.float32
+
+    max_id = int(cls.max().item())
+    if max_id < 0:  # all labels negative -> just return default
+        return torch.full(cls.shape, default, device=device, dtype=dtype)
+
+    table = torch.full((max_id + 1,), default, device=device, dtype=dtype)
+
+    # Fill only the keys that appear (<= max_id). Small CPU lists -> single device copy.
+    keys_in_range = [k for k in radii.keys() if 0 <= k <= max_id]
+    if keys_in_range:
+        k_t = torch.tensor(keys_in_range, device=device, dtype=torch.long)
+        v_t = torch.tensor([radii[k] for k in keys_in_range], device=device, dtype=dtype)
+        table[k_t] = v_t
+
+    # Unknown/negative labels get `default` via a masked assignment
+    out = table[cls.long().clamp(min=0)]
+    out = torch.where(cls.long() < 0, torch.as_tensor(default, device=device, dtype=dtype), out)
+    return out
