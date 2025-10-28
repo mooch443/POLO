@@ -345,55 +345,59 @@ def loc_nms(preds: torch.Tensor,
             radii,
             dor_thres: float) -> torch.Tensor:
     """
-    Greedy NMS by DoR threshold with uint64 bit-packed suppression (fast, on-device).
-    API-compatible with the original function.
+    Greedy NMS by DoR threshold with bit-packed suppression (fast, on-device).
+    - Packs columns into 32-bit chunks represented as int64 words (CUDA-friendly).
+    - No CUDA bit-shifts are used.
+    API-compatible with your original function.
     """
     device = preds.device
     N = preds.size(0)
     if N == 0:
         return torch.empty((0,), dtype=torch.long, device=device)
 
-    # Order by descending score
+    # Sort detections by score (desc)
     order = scores.reshape(-1).argsort(descending=True)
-    locs = preds.index_select(0, order)
+    locs_ordered = preds.index_select(0, order)
 
-    # Pairwise DoR (N,N). Only upper triangle is needed (j>i suppressed by i)
-    dor = loc_dor_pw(locs, locs, radii)          # (N, N)
-    sup_bool = (dor < dor_thres).triu(diagonal=1)  # (N, N) bool
-    del dor  # free early
+    # Pairwise DoR and upper-triangular suppression mask (j > i suppressed when i is kept)
+    dor = loc_dor_pw(locs_ordered, locs_ordered, radii)          # (N, N)
+    sup_bool = (dor < dor_thres).triu(diagonal=1)                 # (N, N) bool
+    del dor
 
-    # Pack columns into 64-bit chunks
-    CHUNK = 64
+    # ---- Bit-pack columns into 32-bit chunks (stored as int64 words) ----
+    CHUNK = 32  # pack 32 columns per word
     n_chunks = (N + CHUNK - 1) // CHUNK
     pad_cols = n_chunks * CHUNK - N
     if pad_cols:
-        sup_bool = F.pad(sup_bool, (0, pad_cols))  # pad columns to multiple of 64
+        sup_bool = F.pad(sup_bool, (0, pad_cols))                 # pad columns to multiple of 32
 
-    # reshape to (N, n_chunks, 64)
+    # (N, n_chunks, 32)
     sup_view = sup_bool.view(N, n_chunks, CHUNK)
     del sup_bool
 
-    # Build packed mask: (N, n_chunks) uint64
-    sup_packed = torch.zeros((N, n_chunks), dtype=torch.uint64, device=device)
-    # Use a tiny fixed loop; shifting by Python int is supported on CUDA
-    for b in range(CHUNK):
-        # take bit b, cast to uint64, shift into position, OR-accumulate
-        sup_packed |= (sup_view[:, :, b].to(torch.uint64) << b)
+    # Build bit weights on CPU (safe shifts), then move to device
+    # dtype=int64 so we can OR/sum reliably on CUDA
+    bit_weights_cpu = (1 << torch.arange(CHUNK, dtype=torch.int64))  # [1,2,4,...,2^31]
+    bit_weights = bit_weights_cpu.to(device)                          # (32,)
+
+    # Pack along the last dim: (N, n_chunks)
+    sup_packed = (sup_view.to(torch.int64) * bit_weights.view(1, 1, CHUNK)).sum(dim=2)
     del sup_view
 
-    # Greedy selection over packed bitsets
-    suppressed = torch.zeros(n_chunks, dtype=torch.uint64, device=device)
+    # ---- Greedy selection over packed bitsets ----
+    suppressed = torch.zeros(n_chunks, dtype=torch.int64, device=device)  # global mask of suppressed columns
     keep_idx = []
 
-    # Precompute per-bit masks via Python ints -> torch.uint64 on device (no arange needed)
-    bit_lut = torch.tensor([1 << b for b in range(CHUNK)],
-                           dtype=torch.uint64, device=device)
+    # Precompute per-bit masks (CPU shifts; then to device)
+    bit_lut = bit_weights  # reuse: 1<<b as int64 on device
 
     for i in range(N):
         c = i // CHUNK
-        b = bit_lut[i % CHUNK]
-        if (suppressed[c] & b) != 0:
+        b_mask = bit_lut[i % CHUNK]
+        # If bit set in suppressed -> this detection is already suppressed
+        if (suppressed[c] & b_mask) != 0:
             continue
+        # Keep and suppress its followers
         keep_idx.append(i)
         suppressed |= sup_packed[i]
 
