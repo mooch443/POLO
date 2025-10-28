@@ -269,48 +269,112 @@ class BaseValidator:
 
         return torch.tensor(correct, dtype=torch.bool, device=pred_classes.device)
     
-    def match_predictions_loc(self, pred_classes, true_classes, dor, use_scipy=False):
+    @torch.no_grad()
+    def match_predictions_loc(
+        self,
+        pred_classes: torch.Tensor,   # (D,)
+        true_classes: torch.Tensor,   # (L,)
+        dor: torch.Tensor,            # (L, D) pairwise distance/score; lower is better; 0 = invalid
+        use_scipy: bool = False,
+    ) -> torch.Tensor:
         """
-        Matches predictions to ground truth objects (pred_classes, true_classes) using DoR.
+        Matches predictions (columns, D) to ground-truth labels (rows, L) per DoR threshold.
 
-        Args:
-            pred_classes (torch.Tensor): Predicted class indices of shape(N,).
-            true_classes (torch.Tensor): Target class indices of shape(M,).
-            dor (torch.Tensor): An NxM tensor containing the pairwise DoR values for predictions and ground truth
-            use_scipy (bool): Whether to use scipy for matching (more precise).
-
+        Shapes:
+        pred_classes: (D,)
+        true_classes: (L,)
+        dor:          (L, D)  # NOT (D, L). Rows=labels, Cols=detections
+        self.dorv:    (T,) thresholds
         Returns:
-            (torch.Tensor): Correct tensor of shape(N,10) for 10 DoR thresholds.
+        correct: (D, T) bool tensor on the same device as `dor`.
         """
-        # Dx10 matrix, where D - detections, 10 - DoR thresholds
-        correct = np.zeros((pred_classes.shape[0], self.dorv.shape[0])).astype(bool)
-        # LxD matrix where L - labels (rows), D - detections (columns)
-        correct_class = true_classes[:, None] == pred_classes
-        dor = dor * correct_class  # zero out the wrong classes
-        dor = dor.cpu().numpy()
-        for i, threshold in enumerate(self.dorv.cpu().tolist()):
-            if use_scipy:
-                # WARNING: known issue that reduces mAP in https://github.com/ultralytics/ultralytics/pull/4708
-                import scipy  # scope import to avoid importing for all commands
+        # Ensure everything runs where `dor` lives
+        device = dor.device
+        pred_classes = pred_classes.to(device)
+        true_classes = true_classes.to(device)
 
-                cost_matrix = dor * (dor <= threshold)
-                if cost_matrix.any():
-                    labels_idx, detections_idx = scipy.optimize.linear_sum_assignment(cost_matrix, maximize=True)
-                    valid = cost_matrix[labels_idx, detections_idx] > 0
+        L = int(true_classes.numel())
+        D = int(pred_classes.numel())
+        T = int(self.dorv.numel() if torch.is_tensor(self.dorv) else len(self.dorv))
+
+        if D == 0 or L == 0:
+            return torch.zeros((D, T), dtype=torch.bool, device=device)
+
+        if dor.shape != (L, D):
+            raise ValueError(f"`dor` must be (L,D)=({L},{D}) but got {tuple(dor.shape)}")
+
+        thresholds: torch.Tensor = (
+            self.dorv.to(device=device, dtype=dor.dtype).view(-1)
+            if torch.is_tensor(self.dorv) else
+            torch.tensor(self.dorv, device=device, dtype=dor.dtype).view(-1)
+        )
+
+        # Class-consistency mask (L, D)
+        class_ok = (true_classes[:, None] == pred_classes[None, :])
+
+        correct = torch.zeros((D, T), dtype=torch.bool, device=device)
+
+        if use_scipy:
+            # CPU-only exact assignment path (Hungarian), done only on demand.
+            import numpy as np
+            import scipy.optimize
+
+            dor_cpu = dor.detach().to('cpu')
+            class_ok_cpu = class_ok.detach().to('cpu')
+
+            for i, thr in enumerate(thresholds.detach().cpu().tolist()):
+                # keep only class-matching pairs with 0 < dor <= thr
+                cost = dor_cpu * class_ok_cpu
+                mask = (cost <= thr) & (cost > 0)
+                if not mask.any():
+                    continue
+
+                cm = torch.where(mask, cost, torch.zeros_like(cost)).numpy()
+                li, di = scipy.optimize.linear_sum_assignment(cm, maximize=True)  # preserve Ultralytics behavior
+                if len(li):
+                    valid = cm[li, di] > 0
                     if valid.any():
-                        correct[detections_idx[valid], i] = True
-            else:
-                matches = np.nonzero((dor <= threshold) & (dor > 0))  # DoR < threshold and classes match
-                matches = np.array(matches).T
-                if matches.shape[0]:
-                    if matches.shape[0] > 1:
-                        matches = matches[dor[matches[:, 0], matches[:, 1]].argsort()]
-                        matches = matches[np.unique(matches[:, 1], return_index=True)[1]]
-                        # matches = matches[matches[:, 2].argsort()[::-1]]
-                        matches = matches[np.unique(matches[:, 0], return_index=True)[1]]
-                    correct[matches[:, 1].astype(int), i] = True
+                        correct[torch.as_tensor(di[valid], device=device, dtype=torch.long), i] = True
+            return correct
 
-        return torch.tensor(correct, dtype=torch.bool, device=pred_classes.device)
+        # Pure-Torch greedy matching per threshold (ascending DoR), detection-then-label uniqueness
+        for i in range(thresholds.numel()):
+            thr = thresholds[i]
+            # Candidates: classes match and 0 < DoR <= thr
+            cand = (dor <= thr) & (dor > 0) & class_ok
+            if not cand.any():
+                continue
+
+            lab_idx, det_idx = torch.nonzero(cand, as_tuple=True)  # K candidates
+            costs = dor[lab_idx, det_idx]
+            order = torch.argsort(costs)  # ascending cost
+            lab_idx = lab_idx[order]
+            det_idx = det_idx[order]
+
+            # Keep first occurrence per detection (greedy); stable w.r.t. cost order
+            K = lab_idx.numel()
+            seq = torch.arange(K, device=device, dtype=torch.long)
+            first_for_det = torch.full((D,), K, device=device, dtype=torch.long)
+            first_for_det.scatter_reduce_(0, det_idx, seq, reduce='amin', include_self=True)
+            keep_det = seq == first_for_det[det_idx]
+            lab_idx = lab_idx[keep_det]
+            det_idx = det_idx[keep_det]
+
+            if lab_idx.numel() == 0:
+                continue
+
+            # Then keep first occurrence per label
+            K2 = lab_idx.numel()
+            seq2 = torch.arange(K2, device=device, dtype=torch.long)
+            first_for_lab = torch.full((L,), K2, device=device, dtype=torch.long)
+            first_for_lab.scatter_reduce_(0, lab_idx, seq2, reduce='amin', include_self=True)
+            keep_lab = seq2 == first_for_lab[lab_idx]
+
+            det_final = det_idx[keep_lab]
+            if det_final.numel():
+                correct[det_final, i] = True
+
+        return correct
 
     def add_callback(self, event: str, callback):
         """Appends the given callback."""
