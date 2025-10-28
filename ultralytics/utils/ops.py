@@ -341,34 +341,35 @@ def non_max_suppression(
 
 @torch.no_grad()
 def loc_nms(preds: torch.Tensor,
-                    scores: torch.Tensor,
-                    radii,
-                    dor_thres: float,
-                    block: int = 1024) -> torch.Tensor:
+            scores: torch.Tensor,
+            radii,             # as required by loc_dor_pw
+            dor_thres: float) -> torch.Tensor:
+    """
+    Greedy NMS by DoR threshold; runs entirely on-device.
+    """
     device = preds.device
     if preds.numel() == 0:
         return torch.empty((0,), dtype=torch.long, device=device)
 
     order = scores.reshape(-1).argsort(descending=True)
-    locs = preds.index_select(0, order)
-    N = locs.size(0)
+    locs_ordered = preds.index_select(0, order)
 
+    # Pairwise DoR on the device; try using half/bfloat16 if acceptable
+    dor = loc_dor_pw(locs_ordered, locs_ordered, radii)  # (N, N)
+
+    # We only need to suppress *later* detections -> strictly upper triangle
+    suppress_m = (dor < dor_thres).triu_(diagonal=1)     # (N, N) bool
+
+    N = locs_ordered.size(0)
     suppressed = torch.zeros(N, dtype=torch.bool, device=device)
     keep_mask  = torch.zeros(N, dtype=torch.bool, device=device)
-    cols = torch.arange(N, device=device)
 
-    for i0 in range(0, N, block):
-        i1 = min(i0 + block, N)
-        # DoR for current block vs ALL (single big matmul-like op)
-        D = loc_dor_pw(locs[i0:i1], locs, radii)                 # (B, N)
-        M = (D < dor_thres) & (cols.unsqueeze(0) > torch.arange(i0, i1, device=device).unsqueeze(1))
-        # Greedy within the block (small loop is fine)
-        for k in range(i1 - i0):
-            i = i0 + k
-            if suppressed[i]:
-                continue
-            keep_mask[i] = True
-            suppressed |= M[k]
+    # Vectorized row-wise OR — no .nonzero() inside the loop
+    for i in range(N):
+        if suppressed[i]:
+            continue
+        keep_mask[i] = True
+        suppressed |= suppress_m[i]   # suppress later neighbors in a single fused op
 
     keep = keep_mask.nonzero(as_tuple=False).squeeze(1)
     return order.index_select(0, keep)
