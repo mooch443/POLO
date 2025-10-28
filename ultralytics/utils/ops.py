@@ -342,36 +342,60 @@ def non_max_suppression(
 @torch.no_grad()
 def loc_nms(preds: torch.Tensor,
             scores: torch.Tensor,
-            radii,             # as required by loc_dor_pw
+            radii,
             dor_thres: float) -> torch.Tensor:
     """
-    Greedy NMS by DoR threshold; runs entirely on-device.
+    Greedy NMS by DoR threshold with bit-packed suppression masks (fast, on-device).
+    API-compatible with the original function.
     """
     device = preds.device
-    if preds.numel() == 0:
+    N = preds.size(0)
+    if N == 0:
         return torch.empty((0,), dtype=torch.long, device=device)
 
+    # Sort by score desc
     order = scores.reshape(-1).argsort(descending=True)
-    locs_ordered = preds.index_select(0, order)
+    locs = preds.index_select(0, order)
 
-    # Pairwise DoR on the device; try using half/bfloat16 if acceptable
-    dor = loc_dor_pw(locs_ordered, locs_ordered, radii)  # (N, N)
+    # Pairwise DoR (L=D=N), only need strict upper triangle for suppression
+    dor = loc_dor_pw(locs, locs, radii)  # (N, N), lower=mirror, diag=self
+    sup_bool = (dor < dor_thres).triu(diagonal=1)  # (N, N) bool; j>i means j suppressed when i kept
+    del dor  # free memory asap
 
-    # We only need to suppress *later* detections -> strictly upper triangle
-    suppress_m = (dor < dor_thres).triu_(diagonal=1)     # (N, N) bool
+    # ---- Bit-pack columns (N) into 64-bit words to reduce per-step work by ~64x ----
+    CHUNK = 64
+    n_chunks = (N + CHUNK - 1) // CHUNK
+    pad_cols = n_chunks * CHUNK - N
+    if pad_cols:
+        # pad columns on the right (affects only dummy bits we never read)
+        sup_bool = F.pad(sup_bool, (0, pad_cols))  # (N, n_chunks*64)
 
-    N = locs_ordered.size(0)
-    suppressed = torch.zeros(N, dtype=torch.bool, device=device)
-    keep_mask  = torch.zeros(N, dtype=torch.bool, device=device)
+    # reshape to (N, n_chunks, 64)
+    sup_view = sup_bool.view(N, n_chunks, CHUNK)
+    # weights 1<<[0..63] as uint64 on device
+    bit_weights = (torch.ones(CHUNK, device=device, dtype=torch.uint64) << torch.arange(CHUNK, device=device, dtype=torch.uint64))
+    # pack: (N, n_chunks)
+    sup_packed = (sup_view.to(torch.uint64) * bit_weights.view(1, 1, CHUNK)).sum(dim=2)
+    del sup_bool, sup_view  # free
 
-    # Vectorized row-wise OR — no .nonzero() inside the loop
+    # ---- Greedy selection over bitsets ----
+    suppressed = torch.zeros(n_chunks, dtype=torch.uint64, device=device)
+    keep_idx = []
+
+    # small LUT for testing bit i within a 64-bit word
+    bit_lut = (torch.ones(CHUNK, device=device, dtype=torch.uint64) << torch.arange(CHUNK, device=device, dtype=torch.uint64))
+
     for i in range(N):
-        if suppressed[i]:
+        c = i // CHUNK
+        b = bit_lut[i % CHUNK]
+        # if current bit set -> suppressed, skip
+        if (suppressed[c] & b) != 0:
             continue
-        keep_mask[i] = True
-        suppressed |= suppress_m[i]   # suppress later neighbors in a single fused op
+        # keep and OR its suppression row into global mask
+        keep_idx.append(i)
+        suppressed |= sup_packed[i]
 
-    keep = keep_mask.nonzero(as_tuple=False).squeeze(1)
+    keep = torch.as_tensor(keep_idx, device=device, dtype=torch.long)
     return order.index_select(0, keep)
 
 def non_max_suppression_loc(
