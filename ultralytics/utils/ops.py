@@ -339,40 +339,39 @@ def non_max_suppression(
 
     return output
 
-def loc_nms(preds, scores, radii, dor_thres) -> torch.Tensor:
-    """
-    PyTorch version of NMS as implemented in C++ in the torch package. Adjusted 
-    for localizations. Significantly slower!
-
-    Arguments: 
-        dets (torch.Tensor): A tensor (N, 2) containing the predicted locations.
-        scores (torch.Tensor): A Tensor (N, 1) containing the prediction confidence scores.
-        dor_thresh (float): Float specifying the DoR for suppressing redundant localizations. 
-    Returns:
-        (torch.Tensor): A tensor containing the indices of the locations to keep.
-    """
+@torch.no_grad()
+def loc_nms(preds: torch.Tensor,
+                    scores: torch.Tensor,
+                    radii,
+                    dor_thres: float,
+                    block: int = 1024) -> torch.Tensor:
+    device = preds.device
     if preds.numel() == 0:
-        return torch.empty((0,), dtype=torch.long, device=preds.device)
+        return torch.empty((0,), dtype=torch.long, device=device)
 
-    _, order = scores.sort(dim=0, descending=True)
-    ndets = preds.shape[0]
-    suppress_ind = torch.zeros(ndets, dtype=torch.bool, device=preds.device)
-    
-    locs_ordered = preds[order]
-    dor_matrix = loc_dor_pw(locs_ordered, locs_ordered, radii)
+    order = scores.reshape(-1).argsort(descending=True)
+    locs = preds.index_select(0, order)
+    N = locs.size(0)
 
-    suppress_m = (dor_matrix < dor_thres).triu(diagonal=1)
+    suppressed = torch.zeros(N, dtype=torch.bool, device=device)
+    keep_mask  = torch.zeros(N, dtype=torch.bool, device=device)
+    cols = torch.arange(N, device=device)
 
-    for i in range(ndets):
-        if suppress_ind[i] == 1:
-            continue
+    for i0 in range(0, N, block):
+        i1 = min(i0 + block, N)
+        # DoR for current block vs ALL (single big matmul-like op)
+        D = loc_dor_pw(locs[i0:i1], locs, radii)                 # (B, N)
+        M = (D < dor_thres) & (cols.unsqueeze(0) > torch.arange(i0, i1, device=device).unsqueeze(1))
+        # Greedy within the block (small loop is fine)
+        for k in range(i1 - i0):
+            i = i0 + k
+            if suppressed[i]:
+                continue
+            keep_mask[i] = True
+            suppressed |= M[k]
 
-        suppress_ind[suppress_m[i].nonzero()] = True
-
-    keep_ind = (~suppress_ind).nonzero().squeeze(-1)
-
-    return order[keep_ind]
-
+    keep = keep_mask.nonzero(as_tuple=False).squeeze(1)
+    return order.index_select(0, keep)
 
 def non_max_suppression_loc(
     prediction,

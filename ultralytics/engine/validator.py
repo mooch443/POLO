@@ -270,109 +270,82 @@ class BaseValidator:
         return torch.tensor(correct, dtype=torch.bool, device=pred_classes.device)
     
     @torch.no_grad()
-    def match_predictions_loc(
-        self,
-        pred_classes: torch.Tensor,   # (D,)
-        true_classes: torch.Tensor,   # (L,)
-        dor: torch.Tensor,            # (L, D) pairwise distance/score; lower is better; 0 = invalid
-        use_scipy: bool = False,
-    ) -> torch.Tensor:
+    def match_predictions_loc(self,
+                            pred_classes: torch.Tensor,   # (D,)
+                            true_classes: torch.Tensor,   # (L,)
+                            dor: torch.Tensor             # (L, D)  pairwise DoR (lower is better), 0 = invalid
+                            ) -> torch.Tensor:
         """
-        Matches predictions (columns, D) to ground-truth labels (rows, L) per DoR threshold.
-
-        Shapes:
-        pred_classes: (D,)
-        true_classes: (L,)
-        dor:          (L, D)  # NOT (D, L). Rows=labels, Cols=detections
-        self.dorv:    (T,) thresholds
+        Pure-PyTorch, on-device matching.
+        For each DoR threshold t in self.dorv:
+        1) For every detection (col), pick the label (row) with minimal DoR among valid pairs (class match & DoR>0 & DoR<=t).
+        2) If multiple detections picked the same label, keep the one with the lowest DoR (ties broken by smallest det index).
         Returns:
-        correct: (D, T) bool tensor on the same device as `dor`.
+        correct: (D, T) bool tensor on dor.device, where T = len(self.dorv).
         """
-        # Ensure everything runs where `dor` lives
         device = dor.device
-        pred_classes = pred_classes.to(device)
-        true_classes = true_classes.to(device)
-
-        L = int(true_classes.numel())
-        D = int(pred_classes.numel())
-        T = int(self.dorv.numel() if torch.is_tensor(self.dorv) else len(self.dorv))
-
+        D = pred_classes.numel()
+        L = true_classes.numel()
         if D == 0 or L == 0:
+            T = int(self.dorv.numel() if torch.is_tensor(self.dorv) else len(self.dorv))
             return torch.zeros((D, T), dtype=torch.bool, device=device)
 
+        # Ensure shapes: rows=labels (L), cols=detections (D)
         if dor.shape != (L, D):
             raise ValueError(f"`dor` must be (L,D)=({L},{D}) but got {tuple(dor.shape)}")
 
-        thresholds: torch.Tensor = (
-            self.dorv.to(device=device, dtype=dor.dtype).view(-1)
-            if torch.is_tensor(self.dorv) else
-            torch.tensor(self.dorv, device=device, dtype=dor.dtype).view(-1)
-        )
+        # Thresholds (T,)
+        thr = self.dorv.to(device=device, dtype=dor.dtype).flatten()
+        T = thr.numel()
 
-        # Class-consistency mask (L, D)
-        class_ok = (true_classes[:, None] == pred_classes[None, :])
+        # Build a single masked cost matrix where invalid pairs are +inf:
+        #   invalid if class mismatches or dor<=0
+        # (One mask allocation; avoids per-threshold class recomputation.)
+        inf = torch.tensor(float('inf'), device=device, dtype=dor.dtype)
+        class_ok = true_classes.view(L, 1) == pred_classes.view(1, D)   # (L, D) bool
+        valid = class_ok & (dor > 0)
+        masked = torch.where(valid, dor, inf)                           # (L, D) float, inf = not allowed
 
+        # Output
         correct = torch.zeros((D, T), dtype=torch.bool, device=device)
+        det_idx_all = torch.arange(D, device=device)
 
-        if use_scipy:
-            # CPU-only exact assignment path (Hungarian), done only on demand.
-            import numpy as np
-            import scipy.optimize
+        # Per-threshold vectorized selection
+        for i in range(T):
+            t = thr[i]
+            # Mask out costs above threshold
+            cand = torch.where(masked <= t, masked, inf)                # (L, D)
 
-            dor_cpu = dor.detach().to('cpu')
-            class_ok_cpu = class_ok.detach().to('cpu')
+            # Step 1: each detection picks its best label under this threshold
+            # min_cost_per_det: (D,), arg_label_per_det: (D,)
+            min_cost_per_det, arg_label_per_det = cand.min(dim=0)       # along rows (labels)
 
-            for i, thr in enumerate(thresholds.detach().cpu().tolist()):
-                # keep only class-matching pairs with 0 < dor <= thr
-                cost = dor_cpu * class_ok_cpu
-                mask = (cost <= thr) & (cost > 0)
-                if not mask.any():
-                    continue
-
-                cm = torch.where(mask, cost, torch.zeros_like(cost)).numpy()
-                li, di = scipy.optimize.linear_sum_assignment(cm, maximize=True)  # preserve Ultralytics behavior
-                if len(li):
-                    valid = cm[li, di] > 0
-                    if valid.any():
-                        correct[torch.as_tensor(di[valid], device=device, dtype=torch.long), i] = True
-            return correct
-
-        # Pure-Torch greedy matching per threshold (ascending DoR), detection-then-label uniqueness
-        for i in range(thresholds.numel()):
-            thr = thresholds[i]
-            # Candidates: classes match and 0 < DoR <= thr
-            cand = (dor <= thr) & (dor > 0) & class_ok
-            if not cand.any():
+            # Valid proposals are finite
+            valid_det = torch.isfinite(min_cost_per_det)
+            if not valid_det.any():
                 continue
 
-            lab_idx, det_idx = torch.nonzero(cand, as_tuple=True)  # K candidates
-            costs = dor[lab_idx, det_idx]
-            order = torch.argsort(costs)  # ascending cost
-            lab_idx = lab_idx[order]
-            det_idx = det_idx[order]
+            # Step 2: dedupe labels — for each label, keep the detection with the lowest cost
+            # Compute minimal proposed cost per label across detections
+            lbls = arg_label_per_det[valid_det]                         # (K,)
+            costs = min_cost_per_det[valid_det]                         # (K,)
+            min_cost_per_lbl = torch.full((L,), inf, device=device, dtype=dor.dtype)
+            min_cost_per_lbl.scatter_reduce_(0, lbls, costs, reduce='amin', include_self=True)
 
-            # Keep first occurrence per detection (greedy); stable w.r.t. cost order
-            K = lab_idx.numel()
-            seq = torch.arange(K, device=device, dtype=torch.long)
-            first_for_det = torch.full((D,), K, device=device, dtype=torch.long)
-            first_for_det.scatter_reduce_(0, det_idx, seq, reduce='amin', include_self=True)
-            keep_det = seq == first_for_det[det_idx]
-            lab_idx = lab_idx[keep_det]
-            det_idx = det_idx[keep_det]
-
-            if lab_idx.numel() == 0:
+            # Among equal-cost ties for the same label, keep the smallest detection index
+            equal_best = valid_det & (min_cost_per_det == min_cost_per_lbl[arg_label_per_det])
+            if not equal_best.any():
                 continue
 
-            # Then keep first occurrence per label
-            K2 = lab_idx.numel()
-            seq2 = torch.arange(K2, device=device, dtype=torch.long)
-            first_for_lab = torch.full((L,), K2, device=device, dtype=torch.long)
-            first_for_lab.scatter_reduce_(0, lab_idx, seq2, reduce='amin', include_self=True)
-            keep_lab = seq2 == first_for_lab[lab_idx]
+            best_lbls = arg_label_per_det[equal_best]
+            best_dets = det_idx_all[equal_best]
 
-            det_final = det_idx[keep_lab]
-            if det_final.numel():
-                correct[det_final, i] = True
+            # Tie-break: smallest detection index for each label
+            min_det_per_lbl = torch.full((L,), D, device=device, dtype=torch.long)
+            min_det_per_lbl.scatter_reduce_(0, best_lbls, best_dets, reduce='amin', include_self=True)
+
+            selected = equal_best & (det_idx_all == min_det_per_lbl[arg_label_per_det])
+            correct[:, i] = selected
 
         return correct
 
