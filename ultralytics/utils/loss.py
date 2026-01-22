@@ -396,9 +396,7 @@ class v8DetectionLoss:
         return dist2bbox(pred_dist, anchor_points, xywh=False)
 
     def get_assigned_targets_and_loss(self, preds: dict[str, torch.Tensor], batch: dict[str, Any]) -> tuple:
-        """Calculate the sum of the loss for box, cls and dfl multiplied by batch size and return foreground mask and
-        target indices.
-        """
+        """Calculate detection loss along with assignment outputs for downstream tasks."""
         loss = torch.zeros(3, device=self.device)  # box, cls, dfl
         pred_distri, pred_scores = (
             preds["boxes"].permute(0, 2, 1).contiguous(),
@@ -419,7 +417,7 @@ class v8DetectionLoss:
         # Pboxes
         pred_bboxes = self.bbox_decode(anchor_points, pred_distri)  # xyxy, (b, h*w, 4)
 
-        _, target_bboxes, target_scores, fg_mask, _ = self.assigner(
+        _, target_bboxes, target_scores, fg_mask, target_gt_idx = self.assigner(
             pred_scores.detach().sigmoid(),
             (pred_bboxes.detach() * stride_tensor).type(gt_bboxes.dtype),
             anchor_points * stride_tensor,
@@ -435,17 +433,35 @@ class v8DetectionLoss:
         loss[1] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum  # BCE
 
         # Bbox loss
+        target_bboxes_raw = target_bboxes
         if fg_mask.sum():
-            target_bboxes /= stride_tensor
+            target_bboxes_scaled = target_bboxes_raw / stride_tensor
             loss[0], loss[2] = self.bbox_loss(
-                pred_distri, pred_bboxes, anchor_points, target_bboxes, target_scores, target_scores_sum, fg_mask
+                pred_distri,
+                pred_bboxes,
+                anchor_points,
+                target_bboxes_scaled,
+                target_scores,
+                target_scores_sum,
+                fg_mask,
+                imgsz,
+                stride_tensor,
             )
 
         loss[0] *= self.hyp.box  # box gain
         loss[1] *= self.hyp.cls  # cls gain
         loss[2] *= self.hyp.dfl  # dfl gain
 
-        return loss.sum() * batch_size, loss.detach()  # loss(box, cls, dfl)
+        return (fg_mask, target_gt_idx, target_bboxes_raw, anchor_points, stride_tensor), loss, pred_bboxes
+
+    def __call__(self, preds: Any, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute detection loss for a batch."""
+        preds = preds[1] if isinstance(preds, tuple) else preds
+        if isinstance(preds, dict) and "one2many" in preds:
+            preds = preds["one2many"]
+        _, det_loss, _ = self.get_assigned_targets_and_loss(preds, batch)
+        batch_size = preds["scores"].shape[0]
+        return det_loss * batch_size, det_loss.detach()
 
 class MSELoss(nn.Module):
     """Mean squared error loss with a foreground mask."""
@@ -1242,10 +1258,10 @@ class E2ELoss:
 
     def __call__(self, preds: Any, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
         """Calculate the sum of the loss for box, cls and dfl multiplied by batch size."""
-        preds = self.one2many.parse_output(preds)
+        preds = self._parse_output(preds)
         one2many, one2one = preds["one2many"], preds["one2one"]
-        loss_one2many = self.one2many.loss(one2many, batch)
-        loss_one2one = self.one2one.loss(one2one, batch)
+        loss_one2many = self._loss(one2many, self.one2many, batch)
+        loss_one2one = self._loss(one2one, self.one2one, batch)
         return loss_one2many[0] * self.o2m + loss_one2one[0] * self.o2o, loss_one2one[1]
 
     def update(self) -> None:
@@ -1257,6 +1273,22 @@ class E2ELoss:
     def decay(self, x) -> float:
         """Calculate the decayed weight for one-to-many loss based on the current update step."""
         return max(1 - x / max(self.one2one.hyp.epochs - 1, 1), 0) * (self.o2m_copy - self.final_o2m) + self.final_o2m
+
+    def _parse_output(self, preds: Any) -> dict[str, torch.Tensor]:
+        """Normalize predictions for end-to-end losses."""
+        if hasattr(self.one2many, "parse_output"):
+            return self.one2many.parse_output(preds)
+        preds = preds[1] if isinstance(preds, tuple) else preds
+        if isinstance(preds, dict) and "one2one" not in preds and "one2many" in preds:
+            preds = {"one2many": preds["one2many"], "one2one": preds["one2many"]}
+        return preds
+
+    @staticmethod
+    def _loss(preds: dict[str, torch.Tensor], loss_fn: Any, batch: dict[str, torch.Tensor]) -> tuple:
+        """Compute loss using loss_fn, supporting loss() overrides."""
+        if hasattr(loss_fn, "loss"):
+            return loss_fn.loss(preds, batch)
+        return loss_fn(preds, batch)
 
 
 class TVPDetectLoss:

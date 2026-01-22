@@ -1249,6 +1249,97 @@ class DetMetrics(SimpleClass, DataExportMixin):
         ]
 
 
+class LocMetrics(SimpleClass, DataExportMixin):
+    """Utility class for computing localization metrics based on DoR thresholds."""
+
+    def __init__(self, names: dict[int, str] = {}, save_dir: Path = Path("."), on_plot=None) -> None:
+        self.names = names
+        self.loc = Metric()
+        self.speed = {"preprocess": 0.0, "inference": 0.0, "loss": 0.0, "postprocess": 0.0}
+        self.task = "locate"
+        self.plot = False
+        self.save_dir = save_dir
+        self.on_plot = on_plot
+        self.nt_per_class = None
+
+    def process(self, tp, conf, pred_cls, target_cls) -> dict[str, np.ndarray]:
+        stats = dict(tp=tp, conf=conf, pred_cls=pred_cls, target_cls=target_cls)
+        if not stats:
+            return stats
+        results = ap_per_class(
+            stats["tp"],
+            stats["conf"],
+            stats["pred_cls"],
+            stats["target_cls"],
+            plot=self.plot,
+            save_dir=self.save_dir,
+            names=self.names,
+            on_plot=self.on_plot,
+            prefix="Loc",
+        )[2:]
+        self.loc.nc = len(self.names)
+        self.loc.update(results)
+        self.nt_per_class = np.bincount(stats["target_cls"].astype(int), minlength=len(self.names))
+        return stats
+
+    @property
+    def keys(self) -> list[str]:
+        return ["metrics/precision(L)", "metrics/recall(L)", "metrics/mAP100(L)", "metrics/mAP100-10(L)"]
+
+    def mean_results(self) -> list[float]:
+        return self.loc.mean_results()
+
+    def class_result(self, i: int) -> tuple[float, float, float, float]:
+        return self.loc.class_result(i)
+
+    @property
+    def maps(self) -> np.ndarray:
+        return self.loc.maps
+
+    @property
+    def fitness(self) -> float:
+        return self.loc.fitness()
+
+    @property
+    def ap_class_index(self) -> list:
+        return self.loc.ap_class_index
+
+    @property
+    def results_dict(self) -> dict[str, float]:
+        keys = [*self.keys, "fitness"]
+        values = ((float(x) if hasattr(x, "item") else x) for x in ([*self.mean_results(), self.fitness]))
+        return dict(zip(keys, values))
+
+    @property
+    def curves(self) -> list[str]:
+        return ["Precision-Recall(L)", "F1-Confidence(L)", "Precision-Confidence(L)", "Recall-Confidence(L)"]
+
+    @property
+    def curves_results(self) -> list[list]:
+        return self.loc.curves_results
+
+    def summary(self, normalize: bool = True, decimals: int = 5) -> list[dict[str, Any]]:
+        """Generate a summarized representation of per-class localization metrics."""
+        per_class = {
+            "Loc-P": self.loc.p,
+            "Loc-R": self.loc.r,
+            "Loc-F1": self.loc.f1,
+        }
+        if not len(per_class["Loc-P"]):
+            return []
+        return [
+            {
+                "Class": self.names[self.ap_class_index[i]],
+                "Images": 0,
+                "Instances": int(self.nt_per_class[self.ap_class_index[i]]) if self.nt_per_class is not None else 0,
+                **{k: round(float(v[i]), decimals) for k, v in per_class.items()},
+                "mAP100": round(self.class_result(i)[2], decimals),
+                "mAP100-10": round(self.class_result(i)[3], decimals),
+            }
+            for i in range(len(per_class["Loc-P"]))
+        ]
+
+
 class SegmentMetrics(DetMetrics):
     """Calculate and aggregate detection and segmentation metrics over a given set of classes.
 

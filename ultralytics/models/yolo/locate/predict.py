@@ -28,8 +28,11 @@ class LocalizationPredictor(BasePredictor):
         self.args.task = "locate"
 
         if radii is None:
-            data = check_det_dataset(dataset=self.data)
-            radii = data["radii"]
+            if self.data:
+                data = check_det_dataset(dataset=self.data)
+                radii = data["radii"]
+            else:
+                radii = getattr(self.model, "radii", None) or {}
 
         self.radii = radii
 

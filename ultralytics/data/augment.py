@@ -1157,6 +1157,8 @@ class RandomPerspective:
             >>> M = torch.eye(3)
             >>> transformed_bboxes = apply_bboxes(bboxes, M)
         """
+        if bboxes is None:
+            return None
         n = len(bboxes)
         if n == 0:
             return bboxes
@@ -1339,6 +1341,19 @@ class RandomPerspective:
         )
         # Clip
         good = new_instances.clip(*self.size)
+
+        if instances.bboxes is None:
+            if good is not None:
+                cls = cls[good]
+                if "radii" in labels:
+                    radii = labels["radii"]
+                    if len(radii) == len(good):
+                        labels["radii"] = radii[good]
+            labels["instances"] = new_instances
+            labels["cls"] = cls
+            labels["img"] = img
+            labels["resized_shape"] = img.shape[:2]
+            return labels
 
         # Filter instances
         instances.scale(scale_w=scale, scale_h=scale, bbox_only=True)
@@ -1851,7 +1866,7 @@ class Albumentations:
         - Some transforms are applied with very low probability (0.01) by default.
     """
 
-    def __init__(self, p: float = 1.0, transforms: list | None = None) -> None:
+    def __init__(self, p: float = 1.0, transforms: list | None = None, use_locations: bool = False) -> None:
         """Initialize the Albumentations transform object for YOLO bbox formatted parameters.
 
         This class applies various image augmentations using the Albumentations library, including Blur, Median Blur,
@@ -1861,6 +1876,7 @@ class Albumentations:
         Args:
             p (float): Probability of applying the augmentations. Must be between 0 and 1.
             transforms (list, optional): List of custom Albumentations transforms. If None, uses default transforms.
+            use_locations (bool, optional): Whether labels include center-radius locations for locate tasks.
 
         Raises:
             ImportError: If the Albumentations package is not installed.
@@ -2021,6 +2037,7 @@ class Format:
         return_mask (bool): Whether to return instance masks for segmentation.
         return_keypoint (bool): Whether to return keypoints for pose estimation.
         return_obb (bool): Whether to return oriented bounding boxes.
+        return_locations (bool): Whether to return locations and radii for locate tasks.
         mask_ratio (int): Downsample ratio for masks.
         mask_overlap (bool): Whether to overlap masks.
         batch_idx (bool): Whether to keep batch indexes.
@@ -2046,6 +2063,7 @@ class Format:
         return_mask: bool = False,
         return_keypoint: bool = False,
         return_obb: bool = False,
+        return_locations: bool = False,
         mask_ratio: int = 4,
         mask_overlap: bool = True,
         batch_idx: bool = True,
@@ -2062,6 +2080,7 @@ class Format:
             return_mask (bool): If True, returns instance masks for segmentation tasks.
             return_keypoint (bool): If True, returns keypoints for pose estimation tasks.
             return_obb (bool): If True, returns oriented bounding boxes.
+            return_locations (bool): If True, returns locations and radii for locate tasks.
             mask_ratio (int): Downsample ratio for masks.
             mask_overlap (bool): If True, allows mask overlap.
             batch_idx (bool): If True, keeps batch indexes.
@@ -2072,6 +2091,7 @@ class Format:
         self.return_mask = return_mask  # set False when training detection only
         self.return_keypoint = return_keypoint
         self.return_obb = return_obb
+        self.return_locations = return_locations
         self.mask_ratio = mask_ratio
         self.mask_overlap = mask_overlap
         self.batch_idx = batch_idx  # keep the batch indexes

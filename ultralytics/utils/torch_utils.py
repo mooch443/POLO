@@ -556,6 +556,11 @@ def unwrap_model(m: nn.Module) -> nn.Module:
             return m
 
 
+def de_parallel(model: nn.Module) -> nn.Module:
+    """Backwards-compatible alias for unwrap_model."""
+    return unwrap_model(model)
+
+
 def one_cycle(y1=0.0, y2=1.0, steps=100):
     """Return a lambda function for sinusoidal ramp from y1 to y2 https://arxiv.org/pdf/1812.01187.pdf.
 

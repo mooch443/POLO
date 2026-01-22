@@ -27,12 +27,12 @@ class LocalizationValidator(BaseValidator):
         validator()
         ```
     """
-    def __init__(self, dataloader=None, save_dir=None, pbar=None, args=None, _callbacks=None):
+    def __init__(self, dataloader=None, save_dir=None, args=None, _callbacks=None):
         """Initialize detection model with necessary variables and settings."""
         radii = None if "radii" not in args else args.pop("radii")
         dor = None if "dor" not in args else args.pop("dor")
-        
-        super().__init__(dataloader, save_dir, pbar, args, _callbacks)
+
+        super().__init__(dataloader, save_dir, args, _callbacks)
         self.nt_per_class = None
         self.is_coco = False
         self.class_map = None
@@ -140,7 +140,8 @@ class LocalizationValidator(BaseValidator):
                     for k in self.stats.keys():
                         self.stats[k].append(stat[k])
                     if self.args.plots:
-                        radii_t = ops.generate_radii_t(radii=self.radii, cls=cls)
+                        radii = self.radii if self.radii is not None else self.data.get("radii", {})
+                        radii_t = ops.generate_radii_t(radii=radii, cls=cls)
                         self.confusion_matrix.process_batch_loc(
                             localizations=None, gt_locs=location, gt_cls=cls, radii=radii_t
                         )

@@ -531,7 +531,9 @@ class Model(torch.nn.Module):
             self.predictor.setup_model(model=self.model, verbose=is_cli)
         else:  # only update args if predictor is already setup
             if self.task == "locate":
-                    self.predictor.radii = args.pop("radii")
+                radii = args.pop("radii", None)
+                if radii is not None:
+                    self.predictor.radii = radii
             self.predictor.args = get_cfg(self.predictor.args, args)
             if "project" in args or "name" in args:
                 self.predictor.save_dir = get_save_dir(self.predictor.args)
