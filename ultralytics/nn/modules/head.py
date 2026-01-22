@@ -293,8 +293,6 @@ class Locate(nn.Module):
 
         offsets, cls = x_cat.split((self.reg_max * 2, self.nc), 1)
         loc = ((offsets.sigmoid() * 2 - 0.5) + self.anchors) * self.strides
-        offsets, cls = x_cat.split((self.reg_max * 2, self.nc), 1)
-        loc = ((offsets.sigmoid() * 2 - 0.5) + self.anchors) * self.strides
         y = torch.cat((loc, cls.sigmoid()), 1)
         return y if self.export else (y, x)
 

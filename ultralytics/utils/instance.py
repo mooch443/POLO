@@ -225,7 +225,6 @@ class Instances:
         normalized: bool = True,
     ) -> None:
         """Initialize the Instances object with bounding boxes, locations, segments, and keypoints.
-
         Args:
             bboxes (np.ndarray, optional): Bounding boxes with shape (N, 4).
             locations (np.ndarray, optional): Locations with shape (N, 2).

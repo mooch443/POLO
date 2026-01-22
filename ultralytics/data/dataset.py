@@ -28,6 +28,7 @@ from .augment import (
     classify_augmentations,
     classify_transforms,
     v8_transforms,
+    v8_transforms_loc,
 )
 from .base import BaseDataset
 from .converter import merge_multi_segment
@@ -222,13 +223,18 @@ class YOLODataset(BaseDataset):
             hyp.mosaic = hyp.mosaic if self.augment and not self.rect else 0.0
             hyp.mixup = hyp.mixup if self.augment and not self.rect else 0.0
             hyp.cutmix = hyp.cutmix if self.augment and not self.rect else 0.0
-            transforms = v8_transforms(self, self.imgsz, hyp)
+            transforms = (
+                v8_transforms(self, self.imgsz, hyp)
+                if not self.use_locations
+                else v8_transforms_loc(self, self.imgsz, hyp)
+            )
         else:
             transforms = Compose([LetterBox(new_shape=(self.imgsz, self.imgsz), scaleup=False)])
         transforms.append(
             Format(
                 bbox_format="xywh",
                 normalize=True,
+                return_locations=self.use_locations,
                 return_mask=self.use_segments,
                 return_keypoint=self.use_keypoints,
                 return_obb=self.use_obb,

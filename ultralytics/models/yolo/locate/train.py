@@ -126,7 +126,10 @@ class LocalizationTrainer(BaseTrainer):
     def plot_training_samples(self, batch, ni):
         """Plots training samples with their annotations."""
         plot_images(
-            labels=batch,
+            images=batch["img"],
+            batch_idx=batch["batch_idx"],
+            cls=batch["cls"].squeeze(-1),
+            locations=batch["locations"],
             paths=batch["im_file"],
             fname=self.save_dir / f"train_batch{ni}.jpg",
             on_plot=self.on_plot,

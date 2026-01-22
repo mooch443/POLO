@@ -511,7 +511,7 @@ class LocalizationModel(BaseModel):
             self.yaml["backbone"][0][2] = "nn.Identity"
 
         # Define model
-        self.yaml["channels"] = ch  # save channels
+        ch = self.yaml["ch"] = self.yaml.get("ch", ch)  # input channels
         if nc and nc != self.yaml["nc"]:
             LOGGER.info(f"Overriding model.yaml nc={self.yaml['nc']} with nc={nc}")
             self.yaml["nc"] = nc  # override YAML value
@@ -524,14 +524,12 @@ class LocalizationModel(BaseModel):
         if isinstance(m, Locate):
             s = 256  # 2x min stride
             m.inplace = self.inplace
-            self.model.eval()  # Avoid changing batch statistics until training begins
-            m.training = True  # Setting it to True to properly return strides
-            m.stride = torch.tensor([s / x.shape[-2] for x in self.forward(torch.zeros(1, ch, s, s))])  # forward
+            forward = lambda x: self.forward(x)[0] if isinstance(m, (Segment, Pose, OBB)) else self.forward(x)
+            m.stride = torch.tensor([s / x.shape[-2] for x in forward(torch.zeros(1, ch, s, s))])  # forward
             self.stride = m.stride
-            self.model.train()  # Set model back to training(default) mode
             m.bias_init()  # only run once
         else:
-            self.stride = torch.Tensor([32])  # default stride, e.g., RTDETR
+            self.stride = torch.Tensor([32])  # default stride for i.e. RTDETR
 
         # Init weights, biases
         initialize_weights(self)

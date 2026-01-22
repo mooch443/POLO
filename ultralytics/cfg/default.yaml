@@ -93,6 +93,10 @@ workspace: # (float, optional) engine (TensorRT) only; workspace size in GiB, e.
 nms: False # (bool) fuse NMS into exported model when backend supports; if True, conf/iou apply (agnostic_nms except coreml)
 
 # Hyperparameters ------------------------------------------------------------------------------------------------------
+# IMPORTANT: when using point models, geometric augmentations (degrees, translate, scale, shear, perspective, mosaic)
+# can cause labels to be removed from images, as points - unlike boxes - cannot be split into multiple labels.
+# So apply with care in order to not remove an excessive amount of labels from ypur training set. 
+
 lr0: 0.01 # (float) initial learning rate (SGD=1e-2, Adam/AdamW=1e-3)
 lrf: 0.01 # (float) final LR fraction; final LR = lr0 * lrf
 momentum: 0.937 # (float) SGD momentum or Adam beta1

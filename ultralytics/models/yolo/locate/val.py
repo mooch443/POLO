@@ -11,7 +11,7 @@ from ultralytics.engine.validator import BaseValidator
 from ultralytics.utils import LOGGER, ops
 from ultralytics.utils.checks import check_requirements
 from ultralytics.utils.metrics import ConfusionMatrix, LocMetrics, loc_dor_pw
-from ultralytics.utils.plotting import plot_images
+from ultralytics.utils.plotting import output_to_target_loc, plot_images
 
 
 class LocalizationValidator(BaseValidator):
@@ -27,12 +27,12 @@ class LocalizationValidator(BaseValidator):
         validator()
         ```
     """
-    def __init__(self, dataloader=None, save_dir=None, args=None, _callbacks=None):
+    def __init__(self, dataloader=None, save_dir=None, pbar=None, args=None, _callbacks=None):
         """Initialize detection model with necessary variables and settings."""
         radii = None if "radii" not in args else args.pop("radii")
         dor = None if "dor" not in args else args.pop("dor")
 
-        super().__init__(dataloader, save_dir, args, _callbacks)
+        super().__init__(dataloader, save_dir, pbar, args, _callbacks)
         self.nt_per_class = None
         self.is_coco = False
         self.class_map = None
@@ -241,31 +241,14 @@ class LocalizationValidator(BaseValidator):
 
     def plot_predictions(self, batch, preds, ni):
         """Plots predicted locations on input images and saves the result."""
-        if not preds:
-            return
-        max_det = self.args.max_det
-        batch_idx, cls, conf, locations = [], [], [], []
-        for i, pred in enumerate(preds):
-            if pred is None or not len(pred):
-                continue
-            pred = pred[:max_det]
-            batch_idx.append(torch.full((len(pred),), i, device=pred.device))
-            locations.append(pred[:, :2])
-            conf.append(pred[:, 2])
-            cls.append(pred[:, 3])
+        batch_id, cls_id, locs, confs = output_to_target_loc(preds, max_det=self.args.max_det)
 
-        if not batch_idx:
-            return
-
-        batched_preds = {
-            "batch_idx": torch.cat(batch_idx),
-            "cls": torch.cat(cls),
-            "locations": torch.cat(locations),
-            "conf": torch.cat(conf),
-        }
         plot_images(
-            labels=batched_preds,
             images=batch["img"],
+            batch_idx=batch_id,
+            cls=cls_id,
+            locations=locs,
+            confs=confs,
             paths=batch["im_file"],
             fname=self.save_dir / f"val_batch{ni}_pred.jpg",
             names=self.names,

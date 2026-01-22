@@ -86,7 +86,7 @@ The `yolo` command supports various tasks and modes, accepting additional argume
 
 Ultralytics YOLO can also be integrated directly into your Python projects. It accepts the same [configuration arguments](https://docs.ultralytics.com/usage/cfg/) as the CLI:
 
-```python
+```
 from ultralytics import YOLO
 
 # Load a pretrained YOLO26n model

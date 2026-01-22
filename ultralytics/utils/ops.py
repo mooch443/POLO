@@ -1,7 +1,4 @@
-# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
-
-from __future__ import annotations
-
+# Ultralytics YOLO 🚀, AGPL-3.0 license
 import contextlib
 import math
 import re
@@ -326,7 +323,7 @@ def non_max_suppression(
             boxes = torch.cat((x[:, :2] + c, x[:, 2:4], x[:, -1:]), dim=-1)  # xywhr
             i = nms_rotated(boxes, scores, iou_thres)
         else:
-            boxes = x[:, :4] + c  # boxes (offset by class; https://github.com/ultralytics/yolov5/discussions/5825)
+            boxes = x[:, :4] + c  # boxes (offset by class)
             i = torchvision.ops.nms(boxes, scores, iou_thres)  # NMS
 
         i = i[:max_det]  # limit detections
@@ -334,7 +331,6 @@ def non_max_suppression(
         # # Experimental
         # merge = False  # use merge-NMS
         # if merge and (1 < n < 3E3):  # Merge NMS (boxes merged using weighted mean)
-        #     # Update boxes as boxes(i,4) = weights(i,n) * boxes(n,4)
         #     from .metrics import box_iou
         #     iou = box_iou(boxes[i], boxes) > iou_thres  # iou matrix
         #     weights = iou * scores[None]  # box weights
@@ -354,37 +350,66 @@ def non_max_suppression(
 def loc_nms(
     preds: torch.Tensor,
     scores: torch.Tensor,
-    radii: torch.Tensor,
+    radii,
     dor_thres: float,
-    block: int = 1024,
 ) -> torch.Tensor:
+    """
+    Greedy NMS by DoR threshold with bit-packed suppression (fast, on-device).
+    - Packs columns into 32-bit chunks represented as int64 words (CUDA-friendly).
+    - No CUDA bit-shifts are used.
+    API-compatible with your original function.
+    """
     device = preds.device
-    if preds.numel() == 0:
+    N = preds.size(0)
+    if N == 0:
         return torch.empty((0,), dtype=torch.long, device=device)
 
+    # Sort detections by score (desc)
     order = scores.reshape(-1).argsort(descending=True)
-    locs = preds.index_select(0, order)
-    radii_ordered = radii.index_select(0, order)
-    N = locs.size(0)
+    locs_ordered = preds.index_select(0, order)
 
-    suppressed = torch.zeros(N, dtype=torch.bool, device=device)
-    keep_mask = torch.zeros(N, dtype=torch.bool, device=device)
-    cols = torch.arange(N, device=device)
+    # Pairwise DoR and upper-triangular suppression mask (j > i suppressed when i is kept)
+    dor = loc_dor_pw(locs_ordered, locs_ordered, radii)  # (N, N)
+    sup_bool = (dor < dor_thres).triu(diagonal=1)  # (N, N) bool
+    del dor
 
-    for i0 in range(0, N, block):
-        i1 = min(i0 + block, N)
-        # DoR for current block vs ALL (single big matmul-like op)
-        D = loc_dor_pw(locs[i0:i1], locs, radii_ordered[i0:i1])  # (B, N)
-        M = (D < dor_thres) & (cols.unsqueeze(0) > torch.arange(i0, i1, device=device).unsqueeze(1))
-        # Greedy within the block (small loop is fine)
-        for k in range(i1 - i0):
-            i = i0 + k
-            if suppressed[i]:
-                continue
-            keep_mask[i] = True
-            suppressed |= M[k]
+    # ---- Bit-pack columns into 32-bit chunks (stored as int64 words) ----
+    CHUNK = 32  # pack 32 columns per word
+    n_chunks = (N + CHUNK - 1) // CHUNK
+    pad_cols = n_chunks * CHUNK - N
+    if pad_cols:
+        sup_bool = F.pad(sup_bool, (0, pad_cols))  # pad columns to multiple of 32
 
-    keep = keep_mask.nonzero(as_tuple=False).squeeze(1)
+    # (N, n_chunks, 32)
+    sup_view = sup_bool.view(N, n_chunks, CHUNK)
+    del sup_bool
+
+    # Build bit weights on CPU (safe shifts), then move to device
+    bit_weights_cpu = (1 << torch.arange(CHUNK, dtype=torch.int64))  # [1,2,4,...,2^31]
+    bit_weights = bit_weights_cpu.to(device)  # (32,)
+
+    # Pack along the last dim: (N, n_chunks)
+    sup_packed = (sup_view.to(torch.int64) * bit_weights.view(1, 1, CHUNK)).sum(dim=2)
+    del sup_view
+
+    # ---- Greedy selection over packed bitsets ----
+    suppressed = torch.zeros(n_chunks, dtype=torch.int64, device=device)  # global mask of suppressed columns
+    keep_idx = []
+
+    # Precompute per-bit masks (CPU shifts; then to device)
+    bit_lut = bit_weights  # reuse: 1<<b as int64 on device
+
+    for i in range(N):
+        c = i // CHUNK
+        b_mask = bit_lut[i % CHUNK]
+        # If bit set in suppressed -> this detection is already suppressed
+        if (suppressed[c] & b_mask) != 0:
+            continue
+        # Keep and suppress its followers
+        keep_idx.append(i)
+        suppressed |= sup_packed[i]
+
+    keep = torch.as_tensor(keep_idx, device=device, dtype=torch.long)
     return order.index_select(0, keep)
 
 def non_max_suppression_loc(
@@ -522,6 +547,30 @@ def clip_boxes(boxes, shape):
 
 
 def clip_locations(locations, shape, remove_clipped):
+    """Remove or clip locations to image boundaries.
+
+    Args:
+        locations (torch.Tensor): the locations to clip
+        shape (tuple): the shape of the image
+        remove_clipped (bool): if True, locations outside are removed, otherwise clipped
+
+    Returns:
+        (torch.Tensor | numpy.ndarray): remaining locations
+    """
+    if remove_clipped:
+        good = (
+            (locations[..., 0] < shape[1])
+            & (locations[..., 0] > 0)
+            & (locations[..., 1] < shape[0])
+            & (locations[..., 1] > 0)
+        )
+        return locations[good]
+    else:
+        locations[..., 0] = locations[..., 0].clamp(0, shape[1])  # x
+        locations[..., 1] = locations[..., 1].clamp(0, shape[0])  # y
+        return locations
+
+def clip_coords(coords, shape):
     """
     Takes a list of locations and a shape (height, width) and removes the locations that lie outside 
     of the shape.

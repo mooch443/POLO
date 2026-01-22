@@ -113,8 +113,6 @@ class DFLoss(nn.Module):
             + F.cross_entropy(pred_dist, tr.view(-1), reduction="none").view(tl.shape) * wr
         ).mean(-1, keepdim=True)
     
-
-
 class BboxLoss(nn.Module):
     """Criterion class for computing training losses for bounding boxes."""
 
@@ -214,6 +212,40 @@ class RLELoss(nn.Module):
             loss /= len(loss)
 
         return loss.sum()
+
+
+class HausdorffLoss(nn.Module):
+    """
+    Computes the average Hausdorff distance as described in https://arxiv.org/pdf/1806.07564.pdf.
+    Code taken from the corresponding repo: https://github.com/javiribera/locating-objects-without-bboxes
+    """
+
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, pred_locations, target_locations, fg_mask):
+        # When there is no AMP, casting needs to be taken care of manually
+        try:
+            pairwise_dist = torch.cdist(pred_locations[fg_mask], target_locations[fg_mask])
+        except Exception:
+            pairwise_dist = torch.cdist(pred_locations[fg_mask].to(target_locations.dtype), target_locations[fg_mask])
+        res = torch.mean(torch.min(pairwise_dist, dim=0).values) + torch.mean(torch.min(pairwise_dist, dim=1).values)
+        return res
+
+
+class MSELoss(nn.Module):
+    """MSE based loss as found in https://arxiv.org/pdf/2107.12746.pdf"""
+
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, pred_locations, target_locations, fg_mask):
+        assert pred_locations[fg_mask].shape[0] == target_locations[fg_mask].shape[0]  # sanity check
+
+        mse_loss = F.mse_loss(pred_locations[fg_mask], target_locations[fg_mask], reduction="none")
+        loss_final = mse_loss.sum() / pred_locations[fg_mask].shape[0]
+
+        return loss_final
 
 
 class RotatedBboxLoss(BboxLoss):
@@ -417,6 +449,79 @@ class v8DetectionLoss:
         # Pboxes
         pred_bboxes = self.bbox_decode(anchor_points, pred_distri)  # xyxy, (b, h*w, 4)
 
+        _, target_bboxes, target_scores, fg_mask, _ = self.assigner(
+            pred_scores.detach().sigmoid(),
+            (pred_bboxes.detach() * stride_tensor).type(gt_bboxes.dtype),
+            anchor_points * stride_tensor,
+            gt_labels,
+            gt_bboxes,
+            mask_gt,
+        )
+
+        target_scores_sum = max(target_scores.sum(), 1)
+
+        # Cls loss
+        # loss[1] = self.varifocal_loss(pred_scores, target_scores, target_labels) / target_scores_sum  # VFL way
+        loss[1] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum  # BCE
+
+        # Bbox loss
+        if fg_mask.sum():
+            target_bboxes /= stride_tensor
+            loss[0], loss[2] = self.bbox_loss(
+                pred_distri, pred_bboxes, anchor_points, target_bboxes, target_scores, target_scores_sum, fg_mask
+            )
+
+        loss[0] *= self.hyp.box  # box gain
+        loss[1] *= self.hyp.cls  # cls gain
+        loss[2] *= self.hyp.dfl  # dfl gain
+
+        return loss.sum() * batch_size, loss.detach()  # loss(box, cls, dfl)
+
+
+class v8SegmentationLoss(v8DetectionLoss):
+    """Criterion class for computing training losses."""
+
+    def __init__(self, model):  # model must be de-paralleled
+        """Initializes the v8SegmentationLoss class, taking a de-paralleled model as argument."""
+        super().__init__(model)
+        self.overlap = model.args.overlap_mask
+
+    def __call__(self, preds, batch):
+        """Calculate and return the loss for the YOLO model."""
+        loss = torch.zeros(4, device=self.device)  # box, cls, dfl
+        feats, pred_masks, proto = preds if len(preds) == 3 else preds[1]
+        batch_size, _, mask_h, mask_w = proto.shape  # batch size, number of masks, mask height, mask width
+        pred_distri, pred_scores = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2).split(
+            (self.reg_max * 4, self.nc), 1
+        )
+
+        # B, grids, ..
+        pred_scores = pred_scores.permute(0, 2, 1).contiguous()
+        pred_distri = pred_distri.permute(0, 2, 1).contiguous()
+        pred_masks = pred_masks.permute(0, 2, 1).contiguous()
+
+        dtype = pred_scores.dtype
+        imgsz = torch.tensor(feats[0].shape[2:], device=self.device, dtype=dtype) * self.stride[0]  # image size (h,w)
+        anchor_points, stride_tensor = make_anchors(feats, self.stride, 0.5)
+
+        # Targets
+        try:
+            batch_idx = batch["batch_idx"].view(-1, 1)
+            targets = torch.cat((batch_idx, batch["cls"].view(-1, 1), batch["bboxes"]), 1)
+            targets = self.preprocess(targets.to(self.device), batch_size, scale_tensor=imgsz[[1, 0, 1, 0]])
+            gt_labels, gt_bboxes = targets.split((1, 4), 2)  # cls, xyxy
+            mask_gt = gt_bboxes.sum(2, keepdim=True).gt_(0)
+        except RuntimeError as e:
+            raise TypeError(
+                "ERROR ❌ segment dataset incorrectly formatted or not a segment dataset.\n"
+                "This error can occur when incorrectly training a 'segment' model on a 'detect' dataset, "
+                "i.e. 'yolo train model=yolov8n-seg.pt data=coco8.yaml'.\nVerify your dataset is a "
+                "correctly formatted 'segment' dataset using 'data=coco8-seg.yaml' "
+                "as an example.\nSee https://docs.ultralytics.com/datasets/segment/ for help."
+            ) from e
+
+        # Pboxes
+        pred_bboxes = self.bbox_decode(anchor_points, pred_distri)  # xyxy, (b, h*w, 4)
         _, target_bboxes, target_scores, fg_mask, target_gt_idx = self.assigner(
             pred_scores.detach().sigmoid(),
             (pred_bboxes.detach() * stride_tensor).type(gt_bboxes.dtype),

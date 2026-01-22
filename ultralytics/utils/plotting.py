@@ -767,8 +767,15 @@ def save_one_box(
 
 @threaded
 def plot_images(
-    labels: dict[str, Any],
+    labels: dict[str, Any] | None = None,
     images: torch.Tensor | np.ndarray = np.zeros((0, 3, 640, 640), dtype=np.float32),
+    batch_idx: torch.Tensor | np.ndarray | None = None,
+    cls: torch.Tensor | np.ndarray | None = None,
+    bboxes: torch.Tensor | np.ndarray = np.zeros(0, dtype=np.float32),
+    locations: torch.Tensor | np.ndarray = np.zeros((0, 2), dtype=np.float32),
+    confs: torch.Tensor | np.ndarray | None = None,
+    masks: torch.Tensor | np.ndarray = np.zeros(0, dtype=np.uint8),
+    kpts: torch.Tensor | np.ndarray = np.zeros((0, 51), dtype=np.float32),
     paths: list[str] | None = None,
     fname: str = "images.jpg",
     names: dict[int, str] | None = None,
@@ -778,61 +785,52 @@ def plot_images(
     save: bool = True,
     conf_thres: float = 0.25,
 ) -> np.ndarray | None:
-    """Plot image grid with labels, bounding boxes, masks, and keypoints.
+    """Plot image grid with labels, bounding boxes, masks, keypoints, or locations."""
+    if labels is not None:
+        for k in {"cls", "bboxes", "locations", "conf", "masks", "keypoints", "batch_idx", "img"}:
+            if k not in labels:
+                continue
+            if k == "cls" and isinstance(labels[k], torch.Tensor) and labels[k].ndim == 2:
+                labels[k] = labels[k].squeeze(1)
+            if isinstance(labels[k], torch.Tensor):
+                labels[k] = labels[k].cpu().numpy()
 
-    Args:
-        labels (dict[str, Any]): Dictionary containing detection data with keys like 'cls', 'bboxes', 'conf', 'masks',
-            'keypoints', 'batch_idx', 'img'.
-        images (torch.Tensor | np.ndarray]): Batch of images to plot. Shape: (batch_size, channels, height, width).
-        paths (Optional[list[str]]): List of file paths for each image in the batch.
-        fname (str): Output filename for the plotted image grid.
-        names (Optional[dict[int, str]]): Dictionary mapping class indices to class names.
-        on_plot (Optional[Callable]): Optional callback function to be called after saving the plot.
-        max_size (int): Maximum size of the output image grid.
-        max_subplots (int): Maximum number of subplots in the image grid.
-        save (bool): Whether to save the plotted image grid to a file.
-        conf_thres (float): Confidence threshold for displaying detections.
+        cls = labels.get("cls", np.zeros(0, dtype=np.int64))
+        batch_idx = labels.get("batch_idx", np.zeros(cls.shape, dtype=np.int64))
+        bboxes = labels.get("bboxes", np.zeros(0, dtype=np.float32))
+        locations = labels.get("locations", np.zeros((0, 2), dtype=np.float32))
+        confs = labels.get("conf", None)
+        masks = labels.get("masks", np.zeros(0, dtype=np.uint8))
+        kpts = labels.get("keypoints", np.zeros(0, dtype=np.float32))
+        images = labels.get("img", images)
 
-    Returns:
-        (np.ndarray): Plotted image grid as a numpy array if save is False, None otherwise.
-
-    Notes:
-        This function supports both tensor and numpy array inputs. It will automatically
-        convert tensor inputs to numpy arrays for processing.
-
-        Channel Support:
-        - 1 channel: Grayscale
-        - 2 channels: Third channel added as zeros
-        - 3 channels: Used as-is (standard RGB)
-        - 4+ channels: Cropped to first 3 channels
-    """
-    for k in {"cls", "bboxes", "locations", "conf", "masks", "keypoints", "batch_idx", "images"}:
-        if k not in labels:
-            continue
-        if k == "cls" and labels[k].ndim == 2:
-            labels[k] = labels[k].squeeze(1)  # squeeze if shape is (n, 1)
-        if isinstance(labels[k], torch.Tensor):
-            labels[k] = labels[k].cpu().numpy()
-
-    cls = labels.get("cls", np.zeros(0, dtype=np.int64))
-    batch_idx = labels.get("batch_idx", np.zeros(cls.shape, dtype=np.int64))
-    bboxes = labels.get("bboxes", np.zeros(0, dtype=np.float32))
-    locations = labels.get("locations", np.zeros((0, 2), dtype=np.float32))
-    confs = labels.get("conf", None)
-    masks = labels.get("masks", np.zeros(0, dtype=np.uint8))
-    kpts = labels.get("keypoints", np.zeros(0, dtype=np.float32))
-    images = labels.get("img", images)  # default to input images
-
-    if len(images) and isinstance(images, torch.Tensor):
+    if isinstance(images, torch.Tensor):
         images = images.cpu().float().numpy()
+    if cls is None:
+        cls = np.zeros(0, dtype=np.int64)
+    if batch_idx is None:
+        batch_idx = np.zeros(cls.shape, dtype=np.int64)
+    if isinstance(cls, torch.Tensor):
+        cls = cls.cpu().numpy()
+    if isinstance(batch_idx, torch.Tensor):
+        batch_idx = batch_idx.cpu().numpy()
+    if isinstance(bboxes, torch.Tensor):
+        bboxes = bboxes.cpu().numpy()
+    if isinstance(locations, torch.Tensor):
+        locations = locations.cpu().numpy()
+    if isinstance(masks, torch.Tensor):
+        masks = masks.cpu().numpy().astype(int)
+    if isinstance(kpts, torch.Tensor):
+        kpts = kpts.cpu().numpy()
 
     # Handle 2-ch and n-ch images
-    c = images.shape[1]
-    if c == 2:
-        zero = np.zeros_like(images[:, :1])
-        images = np.concatenate((images, zero), axis=1)  # pad 2-ch with a black channel
-    elif c > 3:
-        images = images[:, :3]  # crop multispectral images to first 3 channels
+    if images.size:
+        c = images.shape[1]
+        if c == 2:
+            zero = np.zeros_like(images[:, :1])
+            images = np.concatenate((images, zero), axis=1)  # pad 2-ch with a black channel
+        elif c > 3:
+            images = images[:, :3]  # crop multispectral images to first 3 channels
 
     bs, _, h, w = images.shape  # batch size, _, height, width
     bs = min(bs, max_subplots)  # limit plot images
@@ -1130,6 +1128,16 @@ def output_to_target(output, max_det=300):
         box, conf, cls = o[:max_det, :6].cpu().split((4, 1, 1), 1)
         j = torch.full((conf.shape[0], 1), i)
         targets.append(torch.cat((j, cls, ops.xyxy2xywh(box), conf), 1))
+    targets = torch.cat(targets, 0).numpy()
+    return targets[:, 0], targets[:, 1], targets[:, 2:-1], targets[:, -1]
+
+def output_to_target_loc(output, max_det=300):
+    """Convert model output to target format [batch_id, class_id, x, y, conf] for plotting."""
+    targets = []
+    for i, o in enumerate(output):
+        loc, conf, cls = o[:max_det, :4].cpu().split((2, 1, 1), 1)
+        j = torch.full((conf.shape[0], 1), i)
+        targets.append(torch.cat((j, cls, loc, conf), 1))
     targets = torch.cat(targets, 0).numpy()
     return targets[:, 0], targets[:, 1], targets[:, 2:-1], targets[:, -1]
 
