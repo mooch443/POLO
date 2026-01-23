@@ -61,7 +61,7 @@ TASK2DATA["locate"] = str(_make_locate_dataset())
 
 def _task_model_path(task: str) -> Path:
     if task == "locate":
-        return Path("ultralytics/cfg/models/v8/polov8.yaml")
+        return Path("ultralytics/cfg/models/26/polo26.yaml")
     return WEIGHTS_DIR / TASK2MODEL[task]
 
 # Constants used in tests

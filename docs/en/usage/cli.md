@@ -29,7 +29,7 @@ The Ultralytics command line interface (CLI) provides a straightforward way to u
         ```
 
         Where:
-        - `TASK` (optional) is one of [detect, segment, classify, pose, obb]
+        - `TASK` (optional) is one of [detect, locate, segment, classify, pose, obb]
         - `MODE` (required) is one of [train, val, predict, export, track, benchmark]
         - `ARGS` (optional) are any number of custom `arg=value` pairs like `imgsz=320` that override defaults.
 
@@ -82,7 +82,7 @@ The Ultralytics command line interface (CLI) provides a straightforward way to u
 
 Where:
 
-- `TASK` (optional) is one of `[detect, segment, classify, pose, obb]`. If not explicitly passed, YOLO will attempt to infer the `TASK` from the model type.
+- `TASK` (optional) is one of `[detect, locate, segment, classify, pose, obb]`. If not explicitly passed, YOLO will attempt to infer the `TASK` from the model type.
 - `MODE` (required) is one of `[train, val, predict, export, track, benchmark]`
 - `ARGS` (optional) are any number of custom `arg=value` pairs like `imgsz=320` that override defaults. For a full list of available `ARGS`, see the [Configuration](cfg.md) page and `default.yaml`.
 
@@ -106,6 +106,12 @@ Train YOLO on the COCO8 dataset for 100 epochs at image size 640. For a full lis
 
         ```bash
         yolo detect train data=coco8.yaml model=yolo26n.pt epochs=100 imgsz=640
+        ```
+
+        Train a POLO26 locate model on a localization dataset:
+
+        ```bash
+        yolo locate train data=path/to/locate.yaml model=ultralytics/cfg/models/26/polo26.yaml epochs=100 imgsz=640
         ```
 
     === "Resume"

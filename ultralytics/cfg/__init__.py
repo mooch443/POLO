@@ -64,7 +64,7 @@ TASK2DATA = {
 }
 TASK2MODEL = {
     "detect": "yolo26n.pt",
-    "locate": "polov8.pt",
+    "locate": "ultralytics/cfg/models/26/polo26.yaml",
     "segment": "yolo26n-seg.pt",
     "classify": "yolo26n-cls.pt",
     "pose": "yolo26n-pose.pt",

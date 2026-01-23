@@ -504,7 +504,7 @@ class DetectionModel(BaseModel):
 class LocalizationModel(BaseModel):
     """YOLO localization model for point-based detection."""
 
-    def __init__(self, cfg="polov8n.yaml", ch=3, nc=None, verbose=True):
+    def __init__(self, cfg="polo26n.yaml", ch=3, nc=None, verbose=True):
         """Initialize the YOLO localization model with the given config and parameters."""
         super().__init__()
         self.yaml = cfg if isinstance(cfg, dict) else yaml_model_load(cfg)  # cfg dict
@@ -540,7 +540,7 @@ class LocalizationModel(BaseModel):
         initialize_weights(self)
         if verbose:
             self.info()
-            LOGGER.info("")
+            self.yaml = cfg if isinstance(cfg, dict) else yaml_model_load(cfg)  # cfg dict
 
     def _predict_augment(self, x):
         """Localization models do not support augmented prediction."""
