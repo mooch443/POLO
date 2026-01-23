@@ -544,7 +544,7 @@ class LocalizationModel(BaseModel):
 
     def _predict_augment(self, x):
         """Localization models do not support augmented prediction."""
-        raise NotImplementedError("Augmented prediction not implemented for localization models.")
+        return super()._predict_augment(x)
 
     @staticmethod
     def _descale_pred(p, flips, scale, img_size, dim=1):

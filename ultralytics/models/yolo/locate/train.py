@@ -2,7 +2,7 @@
 
 import math
 import random
-from copy import copy
+from copy import copy, deepcopy
 
 import numpy as np
 import torch.nn as nn
@@ -10,7 +10,7 @@ import torch.nn as nn
 from ultralytics.data import build_dataloader, build_yolo_dataset
 from ultralytics.engine.trainer import BaseTrainer
 from ultralytics.models import yolo
-from ultralytics.nn.tasks import LocalizationModel
+from ultralytics.nn.tasks import LocalizationModel, yaml_model_load
 from ultralytics.utils import LOGGER, RANK
 from ultralytics.utils.plotting import plot_images, plot_labels_loc, plot_results
 from ultralytics.utils.torch_utils import de_parallel, torch_distributed_zero_first
@@ -85,10 +85,17 @@ class LocalizationTrainer(BaseTrainer):
         # TODO: self.model.class_weights = labels_to_class_weights(dataset.labels, nc).to(device) * nc
 
     def get_model(self, cfg=None, weights=None, verbose=True):
-        """Return a YOLO detection model."""
-        model = LocalizationModel(
-            cfg, nc=self.data["nc"], ch=self.data.get("channels", 3), verbose=verbose and RANK == -1
-        )
+        """Return a YOLO localization model updated for dataset channels."""
+        if cfg is None:
+            base_cfg = deepcopy(self.model.yaml)
+        elif isinstance(cfg, dict):
+            base_cfg = deepcopy(cfg)
+        else:
+            base_cfg = yaml_model_load(cfg)
+        ch = self.data.get("channels", 3)
+        base_cfg["ch"] = ch
+        base_cfg["channels"] = ch
+        model = LocalizationModel(base_cfg, nc=self.data["nc"], ch=ch, verbose=verbose and RANK == -1)
         if weights:
             model.load(weights)
         return model
