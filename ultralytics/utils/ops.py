@@ -1,21 +1,21 @@
-# Ultralytics YOLO 🚀, AGPL-3.0 license
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+
+from __future__ import annotations
+
 import contextlib
 import math
 import re
 import time
+from typing import Mapping
 
 import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
-import torchvision
 
-from ultralytics.utils import LOGGER, NOT_MACOS14
-from ultralytics.utils.metrics import batch_probiou, loc_dor_pw
+from ultralytics.utils import NOT_MACOS14
+from ultralytics.utils.metrics import loc_dor_pw
 
-from typing import Mapping, Optional
-
-# test
 
 class Profile(contextlib.ContextDecorator):
     """Ultralytics Profile class for timing code execution.
@@ -135,37 +135,20 @@ def scale_boxes(img1_shape, boxes, img0_shape, ratio_pad=None, padding: bool = T
     boxes[..., :4] /= gain
     return boxes if xywh else clip_boxes(boxes, img0_shape)
 
-def scale_locations(img1_shape, locations, img0_shape, ratio_pad=None, padding=True, remove_clipped: bool = True):
-    """
-    Rescales locations from the shape of the image they were originally specified in (img1_shape) 
-    to the shape of a different image (img0_shape).
 
-    Args:
-        img1_shape (tuple): The shape of the image that the locations are for, in the format of (height, width).
-        locations (torch.Tensor): the locations of the objects in the image, in the format of (x1, y1, x2, y2)
-        img0_shape (tuple): the shape of the target image, in the format of (height, width).
-        ratio_pad (tuple): a tuple of (ratio, pad) for scaling the locations. If not provided, the ratio and pad will be
-            calculated based on the size difference between the two images.
-        padding (bool): If True, assuming the locations are based on image augmented by yolo style. If False then do regular
-            rescaling.
-        remove_clipped (boolean): if True, locations that lie outside of the shape are removed, not clipped
-
-    Returns:
-        locations (torch.Tensor): The scaled locations
-    """
+def scale_locations(img1_shape, locations, img0_shape, ratio_pad=None, padding: bool = True, remove_clipped: bool = True):
+    """Rescale locations from one image shape to another."""
     if ratio_pad is None:  # calculate from img0_shape
         gain = min(img1_shape[0] / img0_shape[0], img1_shape[1] / img0_shape[1])  # gain  = old / new
-        pad = (
-            round((img1_shape[1] - img0_shape[1] * gain) / 2 - 0.1),
-            round((img1_shape[0] - img0_shape[0] * gain) / 2 - 0.1),
-        )  # wh padding
+        pad_x = round((img1_shape[1] - img0_shape[1] * gain) / 2 - 0.1)
+        pad_y = round((img1_shape[0] - img0_shape[0] * gain) / 2 - 0.1)
     else:
         gain = ratio_pad[0][0]
-        pad = ratio_pad[1]
+        pad_x, pad_y = ratio_pad[1]
 
     if padding:
-        locations[..., 0] -= pad[0]  # x padding
-        locations[..., 1] -= pad[1]  # y padding
+        locations[..., 0] -= pad_x  # x padding
+        locations[..., 1] -= pad_y  # y padding
 
     locations[..., :2] /= gain
     return clip_locations(locations, img0_shape, remove_clipped=remove_clipped)
@@ -185,339 +168,6 @@ def make_divisible(x: int, divisor):
     return math.ceil(x / divisor) * divisor
 
 
-def nms_rotated(boxes, scores, threshold=0.45):
-    """
-    NMS for obbs, powered by probiou and fast-nms.
-
-    Args:
-        boxes (torch.Tensor): (N, 5), xywhr.
-        scores (torch.Tensor): (N, ).
-        threshold (float): Iou threshold.
-
-    Returns:
-    """
-    if len(boxes) == 0:
-        return np.empty((0,), dtype=np.int8)
-    sorted_idx = torch.argsort(scores, descending=True)
-    boxes = boxes[sorted_idx]
-    ious = batch_probiou(boxes, boxes).triu_(diagonal=1)
-    pick = torch.nonzero(ious.max(dim=0)[0] < threshold).squeeze_(-1)
-    return sorted_idx[pick]
-
-
-def non_max_suppression(
-    prediction,
-    conf_thres=0.25,
-    iou_thres=0.45,
-    classes=None,
-    agnostic=False,
-    multi_label=False,
-    labels=(),
-    max_det=300,
-    nc=0,  # number of classes (optional)
-    max_time_img=0.05,
-    max_nms=30000,
-    max_wh=7680,
-    in_place=True,
-    rotated=False,
-):
-    """
-    Perform non-maximum suppression (NMS) on a set of boxes, with support for masks and multiple labels per box.
-
-    Args:
-        prediction (torch.Tensor): A tensor of shape (batch_size, num_classes + 4 + num_masks, num_boxes)
-            containing the predicted boxes, classes, and masks. The tensor should be in the format
-            output by a model, such as YOLO.
-        conf_thres (float): The confidence threshold below which boxes will be filtered out.
-            Valid values are between 0.0 and 1.0.
-        iou_thres (float): The IoU threshold below which boxes will be filtered out during NMS.
-            Valid values are between 0.0 and 1.0.
-        classes (List[int]): A list of class indices to consider. If None, all classes will be considered.
-        agnostic (bool): If True, the model is agnostic to the number of classes, and all
-            classes will be considered as one.
-        multi_label (bool): If True, each box may have multiple labels.
-        labels (List[List[Union[int, float, torch.Tensor]]]): A list of lists, where each inner
-            list contains the apriori labels for a given image. The list should be in the format
-            output by a dataloader, with each label being a tuple of (class_index, x1, y1, x2, y2).
-        max_det (int): The maximum number of boxes to keep after NMS.
-        nc (int, optional): The number of classes output by the model. Any indices after this will be considered masks.
-        max_time_img (float): The maximum time (seconds) for processing one image.
-        max_nms (int): The maximum number of boxes into torchvision.ops.nms().
-        max_wh (int): The maximum box width and height in pixels.
-        in_place (bool): If True, the input prediction tensor will be modified in place.
-
-    Returns:
-        (List[torch.Tensor]): A list of length batch_size, where each element is a tensor of
-            shape (num_boxes, 6 + num_masks) containing the kept boxes, with columns
-            (x1, y1, x2, y2, confidence, class, mask1, mask2, ...).
-    """
-
-    # Checks
-    assert 0 <= conf_thres <= 1, f"Invalid Confidence threshold {conf_thres}, valid values are between 0.0 and 1.0"
-    assert 0 <= iou_thres <= 1, f"Invalid IoU {iou_thres}, valid values are between 0.0 and 1.0"
-    if isinstance(prediction, (list, tuple)):  # YOLOv8 model in validation model, output = (inference_out, loss_out)
-        prediction = prediction[0]  # select only inference output
-
-    bs = prediction.shape[0]  # batch size
-    nc = nc or (prediction.shape[1] - 4)  # number of classes
-    nm = prediction.shape[1] - nc - 4
-    mi = 4 + nc  # mask start index
-    xc = prediction[:, 4:mi].amax(1) > conf_thres  # candidates
-
-    # Settings
-    # min_wh = 2  # (pixels) minimum box width and height
-    time_limit = 2.0 + max_time_img * bs  # seconds to quit after
-    multi_label &= nc > 1  # multiple labels per box (adds 0.5ms/img)
-
-    prediction = prediction.transpose(-1, -2)  # shape(1,84,6300) to shape(1,6300,84)
-    if not rotated:
-        if in_place:
-            prediction[..., :4] = xywh2xyxy(prediction[..., :4])  # xywh to xyxy
-        else:
-            prediction = torch.cat((xywh2xyxy(prediction[..., :4]), prediction[..., 4:]), dim=-1)  # xywh to xyxy
-
-    t = time.time()
-    output = [torch.zeros((0, 6 + nm), device=prediction.device)] * bs
-    for xi, x in enumerate(prediction):  # image index, image inference
-        # Apply constraints
-        # x[((x[:, 2:4] < min_wh) | (x[:, 2:4] > max_wh)).any(1), 4] = 0  # width-height
-        x = x[xc[xi]]  # confidence
-
-        # Cat apriori labels if autolabelling
-        if labels and len(labels[xi]) and not rotated:
-            lb = labels[xi]
-            v = torch.zeros((len(lb), nc + nm + 4), device=x.device)
-            v[:, :4] = xywh2xyxy(lb[:, 1:5])  # box
-            v[range(len(lb)), lb[:, 0].long() + 4] = 1.0  # cls
-            x = torch.cat((x, v), 0)
-
-        # If none remain process next image
-        if not x.shape[0]:
-            continue
-
-        # Detections matrix nx6 (xyxy, conf, cls)
-        box, cls, mask = x.split((4, nc, nm), 1)
-
-        if multi_label:
-            i, j = torch.where(cls > conf_thres)
-            x = torch.cat((box[i], x[i, 4 + j, None], j[:, None].float(), mask[i]), 1)
-        else:  # best class only
-            conf, j = cls.max(1, keepdim=True)
-            x = torch.cat((box, conf, j.float(), mask), 1)[conf.view(-1) > conf_thres]
-
-        # Filter by class
-        if classes is not None:
-            x = x[(x[:, 5:6] == torch.tensor(classes, device=x.device)).any(1)]
-
-        # Check shape
-        n = x.shape[0]  # number of boxes
-        if not n:  # no boxes
-            continue
-        if n > max_nms:  # excess boxes
-            x = x[x[:, 4].argsort(descending=True)[:max_nms]]  # sort by confidence and remove excess boxes
-
-        # Batched NMS
-        c = x[:, 5:6] * (0 if agnostic else max_wh)  # classes
-        scores = x[:, 4]  # scores
-        if rotated:
-            boxes = torch.cat((x[:, :2] + c, x[:, 2:4], x[:, -1:]), dim=-1)  # xywhr
-            i = nms_rotated(boxes, scores, iou_thres)
-        else:
-            boxes = x[:, :4] + c  # boxes (offset by class)
-            i = torchvision.ops.nms(boxes, scores, iou_thres)  # NMS
-
-        i = i[:max_det]  # limit detections
-
-        # # Experimental
-        # merge = False  # use merge-NMS
-        # if merge and (1 < n < 3E3):  # Merge NMS (boxes merged using weighted mean)
-        #     from .metrics import box_iou
-        #     iou = box_iou(boxes[i], boxes) > iou_thres  # iou matrix
-        #     weights = iou * scores[None]  # box weights
-        #     x[i, :4] = torch.mm(weights, x[:, :4]).float() / weights.sum(1, keepdim=True)  # merged boxes
-        #     redundant = True  # require redundant detections
-        #     if redundant:
-        #         i = i[iou.sum(1) > 1]  # require redundancy
-
-        output[xi] = x[i]
-        if (time.time() - t) > time_limit:
-            LOGGER.warning(f"WARNING ⚠️ NMS time limit {time_limit:.3f}s exceeded") 
-            break  # time limit exceeded
-
-    return output
-
-@torch.no_grad()
-def loc_nms(
-    preds: torch.Tensor,
-    scores: torch.Tensor,
-    radii,
-    dor_thres: float,
-) -> torch.Tensor:
-    """
-    Greedy NMS by DoR threshold with bit-packed suppression (fast, on-device).
-    - Packs columns into 32-bit chunks represented as int64 words (CUDA-friendly).
-    - No CUDA bit-shifts are used.
-    API-compatible with your original function.
-    """
-    device = preds.device
-    N = preds.size(0)
-    if N == 0:
-        return torch.empty((0,), dtype=torch.long, device=device)
-
-    # Sort detections by score (desc)
-    order = scores.reshape(-1).argsort(descending=True)
-    locs_ordered = preds.index_select(0, order)
-
-    # Pairwise DoR and upper-triangular suppression mask (j > i suppressed when i is kept)
-    dor = loc_dor_pw(locs_ordered, locs_ordered, radii)  # (N, N)
-    sup_bool = (dor < dor_thres).triu(diagonal=1)  # (N, N) bool
-    del dor
-
-    # ---- Bit-pack columns into 32-bit chunks (stored as int64 words) ----
-    CHUNK = 32  # pack 32 columns per word
-    n_chunks = (N + CHUNK - 1) // CHUNK
-    pad_cols = n_chunks * CHUNK - N
-    if pad_cols:
-        sup_bool = F.pad(sup_bool, (0, pad_cols))  # pad columns to multiple of 32
-
-    # (N, n_chunks, 32)
-    sup_view = sup_bool.view(N, n_chunks, CHUNK)
-    del sup_bool
-
-    # Build bit weights on CPU (safe shifts), then move to device
-    bit_weights_cpu = (1 << torch.arange(CHUNK, dtype=torch.int64))  # [1,2,4,...,2^31]
-    bit_weights = bit_weights_cpu.to(device)  # (32,)
-
-    # Pack along the last dim: (N, n_chunks)
-    sup_packed = (sup_view.to(torch.int64) * bit_weights.view(1, 1, CHUNK)).sum(dim=2)
-    del sup_view
-
-    # ---- Greedy selection over packed bitsets ----
-    suppressed = torch.zeros(n_chunks, dtype=torch.int64, device=device)  # global mask of suppressed columns
-    keep_idx = []
-
-    # Precompute per-bit masks (CPU shifts; then to device)
-    bit_lut = bit_weights  # reuse: 1<<b as int64 on device
-
-    for i in range(N):
-        c = i // CHUNK
-        b_mask = bit_lut[i % CHUNK]
-        # If bit set in suppressed -> this detection is already suppressed
-        if (suppressed[c] & b_mask) != 0:
-            continue
-        # Keep and suppress its followers
-        keep_idx.append(i)
-        suppressed |= sup_packed[i]
-
-    keep = torch.as_tensor(keep_idx, device=device, dtype=torch.long)
-    return order.index_select(0, keep)
-
-def non_max_suppression_loc(
-    prediction,
-    conf_thres=0.25,
-    dor_thres=0.3,
-    classes=None,
-    radii=None,
-    agnostic=False,
-    multi_label=False,
-    labels=(),
-    max_det=300,
-    nc=0,  # number of classes (optional)
-    cls_offset = 7860,
-    max_nms=30000,
-):
-    """
-    Perform non-maximum suppression (NMS) on a set of locations, with support for multiple labels per point.
-
-    Args:
-        prediction (torch.Tensor): A tensor of shape (batch_size, num_classes + 2, num_locations)
-            containing the predicted locations and classes. The tensor should be in the format
-            output by a model, such as YOLO.
-        conf_thres (float): The confidence threshold below which locations will be filtered out.
-            Valid values are between 0.0 and 1.0.
-        dor_thres (float): The DoR threshold below which locations will be filtered out during NMS.
-            Valid values are between 0.0 and 1.0.
-        classes (List[int]): A list of class indices to consider. If None, all classes will be considered.
-        radii (Dict): Dictionary containing the radius values for each class. 
-        agnostic (bool): If True, the model is agnostic to the number of classes, and all
-            classes will be considered as one.
-        multi_label (bool): If True, each location may have multiple labels.
-        labels (List[List[Union[int, float, torch.Tensor]]]): A list of lists, where each inner
-            list contains the apriori labels for a given image. The list should be in the format
-            output by a dataloader, with each label being a tuple of (class_index, x, y).
-        max_det (int): The maximum number of locations to keep after NMS.
-        nc (int, optional): The number of classes output by the model. Any indices after this will be considered masks.
-        cls_offset (int): The number of pixels by which to shift each class for spatial separation during NMS.
-        max_nms (int): The maximum number of boxes into NMS
-        
-    Returns:
-        (List[torch.Tensor]): A list of length batch_size, where each element is a tensor of
-            shape (num_locs, 4) containing the kept locations, with columns (x, y, confidence, class).
-    """
-
-    # Checks
-    assert 0 <= conf_thres <= 1, f"Invalid Confidence threshold {conf_thres}, valid values are between 0.0 and 1.0"
-    assert 0 <= dor_thres <= 1, f"Invalid DoR {dor_thres}, valid values are between 0.0 and 1.0"
-    if isinstance(prediction, (list, tuple)):  # YOLOv8 model in validation model, output = (inference_out, loss_out)
-        prediction = prediction[0]  # select only inference output
-
-    bs = prediction.shape[0]  # batch size
-    nc = nc or (prediction.shape[1] - 2)  # number of classes
-    xc = prediction[:, 2:].amax(1) > conf_thres  # candidates
-
-    # Settings
-    multi_label &= nc > 1  # multiple labels per box (adds 0.5ms/img)
-    prediction = prediction.transpose(-1, -2)  # shape(1,84,6300) to shape(1,6300,84)
-
-    output = [torch.zeros((0, 4), device=prediction.device)] * bs
-    for xi, x in enumerate(prediction):  # image index, image inference
-        x = x[xc[xi]]  # confidence
-
-        # Cat apriori labels if autolabelling
-        if labels and len(labels[xi]):
-            lb = labels[xi]
-            v = torch.zeros((len(lb), nc + 2), device=x.device)
-            v[:, :2] = lb[:, 1:3]  # location
-            v[range(len(lb)), lb[:, 0].long() + 2] = 1.0  # cls
-            x = torch.cat((x, v), 0)
-
-        # If none remain process next image
-        if not x.shape[0]:
-            continue
-
-        # Detections matrix nx6 (xyxy, conf, cls)
-        loc, cls = x.split((2, nc), 1)
-
-        if multi_label:
-            i, j = torch.where(cls > conf_thres)
-            x = torch.cat((loc[i], x[i, 2 + j, None], j[:, None].float()), 1)
-        else:  # best class only
-            conf, j = cls.max(1, keepdim=True)
-            x = torch.cat((loc, conf, j.float()), 1)[conf.view(-1) > conf_thres]
-
-        # Filter by class
-        if classes is not None:
-            x = x[(x[:, 3:4] == torch.tensor(classes, device=x.device)).any(1)]
-
-        # Check shape
-        n = x.shape[0]  # number of locations
-        if not n:  # no locations
-            continue
-        if n > max_nms:  # excess boxes
-            x = x[x[:, 2].argsort(descending=True)[:max_nms]]  # sort by confidence and remove excess locations
-
-        # Batched NMS
-        c = x[:, 3:4] * (0 if agnostic else cls_offset)  # classes
-        scores = x[:, 2]  # scores
-        locs = x[:, :2] + c  # locations (offset by class)
-        radii_t = generate_radii_t(radii=radii, cls=x[:, 3:4])
-        i = loc_nms(preds=locs, scores=scores, radii=radii_t, dor_thres=dor_thres)  # NMS
-        i = i[:max_det]  # limit detections
-
-        output[xi] = x[i]
-
-
-    return output
 def clip_boxes(boxes, shape):
     """Clip bounding boxes to image boundaries.
 
@@ -546,17 +196,8 @@ def clip_boxes(boxes, shape):
     return boxes
 
 
-def clip_locations(locations, shape, remove_clipped):
-    """Remove or clip locations to image boundaries.
-
-    Args:
-        locations (torch.Tensor): the locations to clip
-        shape (tuple): the shape of the image
-        remove_clipped (bool): if True, locations outside are removed, otherwise clipped
-
-    Returns:
-        (torch.Tensor | numpy.ndarray): remaining locations
-    """
+def clip_locations(locations, shape, remove_clipped: bool):
+    """Remove or clip locations to image boundaries."""
     if remove_clipped:
         good = (
             (locations[..., 0] < shape[1])
@@ -565,37 +206,9 @@ def clip_locations(locations, shape, remove_clipped):
             & (locations[..., 1] > 0)
         )
         return locations[good]
-    else:
-        locations[..., 0] = locations[..., 0].clamp(0, shape[1])  # x
-        locations[..., 1] = locations[..., 1].clamp(0, shape[0])  # y
-        return locations
-
-def clip_coords(coords, shape):
-    """
-    Takes a list of locations and a shape (height, width) and removes the locations that lie outside 
-    of the shape.
-
-    Args:
-        locations (torch.Tensor): the locations to clip
-        shape (tuple): the shape of the image
-        remove_clipped (boolean): if True, locations that lie outside of the shape are removed, not clipped
-
-    Returns:
-        (torch.Tensor | numpy.ndarray): remaining locations
-    """
-    if remove_clipped:
-        good = (locations[..., 0] < shape[1]) & \
-            (locations[..., 0] > 0) & \
-            (locations[..., 1] < shape[0]) & \
-            (locations[..., 1] > 0) 
-        #if not torch.any(good):
-            #print("WARNING ⚠️: clipping removed all locations!")
-        return locations[good]
-    else:
-        locations[..., 0] = locations[..., 0].clamp(0, shape[1])  # x
-        locations[..., 1] = locations[..., 1].clamp(0, shape[0])  # y
-        return locations
-
+    locations[..., 0] = locations[..., 0].clamp(0, shape[1])  # x
+    locations[..., 1] = locations[..., 1].clamp(0, shape[0])  # y
+    return locations
 def clip_coords(coords, shape):
     """Clip line coordinates to image boundaries.
 
@@ -1013,6 +626,94 @@ def scale_coords(img1_shape, coords, img0_shape, ratio_pad=None, normalize: bool
         coords[..., 1] /= img0_h  # height
     return coords
 
+
+def loc_nms(preds: torch.Tensor, scores: torch.Tensor, radii: torch.Tensor, dor_thres: float) -> torch.Tensor:
+    """Perform DoR-based NMS for localization predictions."""
+    if preds.numel() == 0:
+        return torch.zeros(0, dtype=torch.long, device=preds.device)
+    order = scores.argsort(descending=True)
+    locs_ordered = preds[order]
+    radii_ordered = radii[order]
+    dor = loc_dor_pw(locs_ordered, locs_ordered, radii_ordered)  # (N, N)
+    sup_bool = (dor < dor_thres).triu(diagonal=1)
+    keep = ~sup_bool.any(0)
+    return order[keep]
+
+
+def non_max_suppression_loc(
+    prediction: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+    conf_thres: float = 0.25,
+    dor_thres: float = 0.3,
+    radii: Mapping[int, float] | None = None,
+    classes=None,
+    agnostic: bool = False,
+    multi_label: bool = False,
+    labels=(),
+    max_det: int = 300,
+):
+    """Perform non-maximum suppression for localization predictions."""
+    if isinstance(prediction, (tuple, list)):
+        prediction = prediction[0]
+    bs = prediction.shape[0]
+    nc = prediction.shape[1] - 2
+    max_wh = 4096
+    max_nms = 30000
+    output = [torch.zeros((0, 4), device=prediction.device)] * bs
+
+    for xi, pred in enumerate(prediction):
+        x = pred.transpose(0, 1)  # (num_locs, 2+nc)
+        if labels and len(labels[xi]):
+            lb = labels[xi].to(x.device)
+            if lb.numel():
+                v = torch.zeros((len(lb), 2 + nc), device=x.device)
+                v[:, :2] = lb[:, 1:3]
+                v[torch.arange(len(lb)), (lb[:, 0].long() + 2)] = 1.0
+                x = torch.cat((x, v), 0)
+
+        if multi_label:
+            i, j = (x[:, 2:] > conf_thres).nonzero(as_tuple=False).T
+            x = torch.cat((x[i, :2], x[i, j + 2, None], j[:, None].float()), 1)
+        else:
+            conf, j = x[:, 2:].max(1, keepdim=True)
+            x = torch.cat((x[:, :2], conf, j.float()), 1)
+            x = x[conf.view(-1) > conf_thres]
+
+        if classes is not None:
+            classes_tensor = torch.tensor(classes, device=x.device)
+            x = x[(x[:, 3:4] == classes_tensor).any(1)]
+
+        n = x.shape[0]
+        if not n:
+            continue
+        if n > max_nms:
+            x = x[x[:, 2].argsort(descending=True)[:max_nms]]
+
+        scores = x[:, 2]
+        c = x[:, 3:4] * (0 if agnostic else max_wh)
+        locs = x[:, :2] + c
+        radii_t = generate_radii_t(radii=radii or {}, cls=x[:, 3:4])
+        keep = loc_nms(locs, scores, radii_t, dor_thres)
+        keep = keep[:max_det]
+        output[xi] = x[keep]
+    return output
+
+
+def generate_radii_t(radii: Mapping[int, float], cls: torch.Tensor, default: float = 1.0) -> torch.Tensor:
+    """Map class labels to per-class radii on the same device."""
+    device = cls.device
+    dtype = torch.float32
+    cls_i = cls.long().view(-1)
+    if cls_i.numel() == 0:
+        return torch.empty_like(cls_i, dtype=dtype).view(cls.shape)
+    max_id = int(cls_i.max())
+    radii_map = torch.full((max_id + 1,), float(default), device=device, dtype=dtype)
+    for k, v in radii.items():
+        k_i = int(k)
+        if 0 <= k_i <= max_id:
+            radii_map[k_i] = float(v)
+    return radii_map[cls_i].view(cls.shape)
+
+
 def regularize_rboxes(rboxes):
     """Regularize rotated bounding boxes to range [0, pi/2].
 
@@ -1083,48 +784,9 @@ def clean_str(s):
     Returns:
         (str): A string with special characters replaced by an underscore _.
     """
-    return re.sub(pattern="[|@#!¡·$€%&()=?¿^*;:,¨`´><+]", repl="_", string=s)
+    return re.sub(pattern="[|@#!¡·$€%&()=?¿^*;:,¨`><+]", repl="_", string=s)
 
 
 def empty_like(x):
     """Create empty torch.Tensor or np.ndarray with same shape as input and float32 dtype."""
     return torch.empty_like(x, dtype=x.dtype) if isinstance(x, torch.Tensor) else np.empty_like(x, dtype=x.dtype)
-
-@torch.no_grad()
-def generate_radii_t(
-    radii: Mapping[int, float],
-    cls: torch.Tensor,
-    default: float = 20.0,
-    dtype: Optional[torch.dtype] = None,
-) -> torch.Tensor:
-    """
-    Map integer class labels in `cls` to per-class radii on the same device.
-    Works during training (no CPU<->GPU roundtrips), differentiability not needed.
-
-    radii: dict {class_id:int -> radius:float}
-    cls:   int tensor of any shape on any device
-    default: radius used for unknown labels
-    """
-    if cls.numel() == 0:
-        return cls.new_empty(cls.shape, dtype=dtype or torch.float32)
-
-    device = cls.device
-    dtype = dtype or torch.float32
-
-    max_id = int(cls.max().item())
-    if max_id < 0:  # all labels negative -> just return default
-        return torch.full(cls.shape, default, device=device, dtype=dtype)
-
-    table = torch.full((max_id + 1,), default, device=device, dtype=dtype)
-
-    # Fill only the keys that appear (<= max_id). Small CPU lists -> single device copy.
-    keys_in_range = [k for k in radii.keys() if 0 <= k <= max_id]
-    if keys_in_range:
-        k_t = torch.tensor(keys_in_range, device=device, dtype=torch.long)
-        v_t = torch.tensor([radii[k] for k in keys_in_range], device=device, dtype=dtype)
-        table[k_t] = v_t
-
-    # Unknown/negative labels get `default` via a masked assignment
-    out = table[cls.long().clamp(min=0)]
-    out = torch.where(cls.long() < 0, torch.as_tensor(default, device=device, dtype=dtype), out)
-    return out

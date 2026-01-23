@@ -456,24 +456,24 @@ class ConfusionMatrix(DataExportMixin):
                 self.matrix[dc, self.nc] += 1  # FP
                 self._append_matches("FP", detections, i)
 
-    def process_batch_loc(self, localizations, gt_locs, gt_cls, radii):
+    def process_batch_loc(self, localizations, gt_locs, gt_cls, radii=None):
         """
         Update confusion matrix for localization task.
 
         Args:
             localizations (Array[M, 4]): Detected locations and their associated information.
                                          Each row should contain (x, y, conf, class).
-            gt_locs (Array[M, 2]): Ground truth locations in xy format.
+            gt_locs (Array[M, 2]: Ground truth locations in xy format.
             gt_cls (Array[M]): The class labels.
-            radii (Array[M, 1]): Radii for DoR calculation per ground-truth instance.
+            radii (Array[M] | None): The radius values for the classes.
         """
         assert len(gt_cls.shape) == 1
 
         if gt_cls.shape[0] == 0:  # Check if labels is empty
             if localizations is not None:
                 localizations = localizations[localizations[:, 2] > self.conf]
-                location_classes = localizations[:, 3].int()
-                for lc in location_classes:
+                localization_classes = localizations[:, 3].int()
+                for lc in localization_classes:
                     self.matrix[lc, self.nc] += 1  # false positives
             return
         if localizations is None or localizations.shape[0] == 0:
@@ -488,63 +488,6 @@ class ConfusionMatrix(DataExportMixin):
             for gc in gt_classes:
                 self.matrix[self.nc, gc] += 1  # background FN
             return
-        gt_classes = gt_cls.int()
-        localization_classes = localizations[:, 3].int()
-        dor = loc_dor_pw(loc1=gt_locs, loc2=localizations[:, :2], radii=radii)
-
-        x = torch.where(dor < self.dor_thres)
-        if x[0].shape[0]:
-            matches = torch.cat((torch.stack(x, 1), dor[x[0], x[1]][:, None]), 1).cpu().numpy()
-            if x[0].shape[0] > 1:
-                matches = matches[matches[:, 2].argsort()]
-                matches = matches[np.unique(matches[:, 1], return_index=True)[1]]
-                matches = matches[matches[:, 2].argsort()]
-                matches = matches[np.unique(matches[:, 0], return_index=True)[1]]
-        else:
-            matches = np.zeros((0, 3))
-
-        n = matches.shape[0] > 0
-        m0, m1, _ = matches.transpose().astype(int)
-        for i, gc in enumerate(gt_classes):
-            j = m0 == i
-            if n and sum(j) == 1:
-                self.matrix[localization_classes[m1[j]], gc] += 1  # correct
-            else:
-                self.matrix[self.nc, gc] += 1  # true background
-
-        if n:
-            for i, lc in enumerate(localization_classes):
-                if not any(m1 == i):
-                    self.matrix[lc, self.nc] += 1  # predicted background
-
-
-    def process_batch_loc(self, localizations, gt_locs, gt_cls, radii=None):
-        """
-        Update confusion matrix for localization task.
-
-        Args:
-            localizations (Array[M, 4]): Detected locations and their associated information.
-                                         Each row should contain (x, y, conf, class).
-            gt_locs (Array[M, 2]: Ground truth locations in xy format.
-            gt_cls (Array[M]): The class labels.
-            radii (Array[M]): The raidus values for the classes.
-        """
-        assert len(gt_cls.shape) == 1
-
-        if gt_cls.shape[0] == 0:  # Check if labels is empty
-            if localizations is not None:
-                localizations = localizations[localizations[:, 2] > self.conf]
-                localization_classes = localizations[:, 3].int()
-                for lc in localization_classes:
-                    self.matrix[lc, self.nc] += 1  # false positives
-            return
-        if localizations is None:
-            gt_classes = gt_cls.int()
-            for gc in gt_classes:
-                self.matrix[self.nc, gc] += 1  # background FN
-            return
-
-        localizations = localizations[localizations[:, 2] > self.conf]
 
         gt_classes = gt_cls.int()
         localization_classes = localizations[:, 3].int()
@@ -574,8 +517,6 @@ class ConfusionMatrix(DataExportMixin):
             for i, lc in enumerate(localization_classes):
                 if not any(m1 == i):
                     self.matrix[lc, self.nc] += 1  # predicted background
-
-
     def matrix(self):
         """Return the confusion matrix."""
         return self.matrix
@@ -763,7 +704,17 @@ def plot_pr_curve(
     on_plot=None,
     task: str = "detect",
 ):
-    """Plot precision-recall curve."""
+    """Plot precision-recall curve.
+
+    Args:
+        px (np.ndarray): X values for the PR curve.
+        py (np.ndarray): Y values for the PR curve.
+        ap (np.ndarray): Average precision values.
+        save_dir (Path, optional): Path to save the plot.
+        names (dict[int, str], optional): Dictionary mapping class indices to class names.
+        on_plot (callable, optional): Function to call after plot is saved.
+        task (str, optional): Task identifier, e.g., "detect" or "locate".
+    """
     import matplotlib.pyplot as plt  # scope for faster 'import ultralytics'
     fig, ax = plt.subplots(1, 1, figsize=(9, 6), tight_layout=True)
     py = np.stack(py, axis=1)
@@ -1329,9 +1280,9 @@ class DetMetrics(SimpleClass, DataExportMixin):
                 values.
 
         Examples:
-            >>> results = model.val(data="coco8.yaml")
-            >>> detection_summary = results.summary()
-            >>> print(detection_summary)
+           >>> results = model.val(data="coco8.yaml")
+           >>> detection_summary = results.summary()
+           >>> print(detection_summary)
         """
         per_class = {
             "Box-P": self.box.p,

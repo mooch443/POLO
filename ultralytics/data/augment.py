@@ -761,8 +761,7 @@ class Mosaic(BaseMixTransform):
             >>> updated_labels = Mosaic._update_labels(labels, padw, padh)
         """
         nh, nw = labels["img"].shape[:2]
-        if labels["instances"].bboxes is not None:
-            labels["instances"].convert_bbox(format="xyxy")
+        labels["instances"].convert_bbox(format="xyxy")
         labels["instances"].denormalize(nw, nh)
         labels["instances"].add_padding(padw, padh)
         return labels
@@ -797,17 +796,14 @@ class Mosaic(BaseMixTransform):
             return {}
         cls = []
         instances = []
-
-        # add radii to final labels if task is locate
-        if self.dataset.use_locations:
-            radii = []
-
+        radii = []
+        use_locations = getattr(self.dataset, "use_locations", False)
         imgsz = self.imgsz * 2  # mosaic imgsz
         for labels in mosaic_labels:
-            if self.dataset.use_locations:
-                radii.append(labels["radii"])
             cls.append(labels["cls"])
             instances.append(labels["instances"])
+            if use_locations:
+                radii.append(labels["radii"])
         # Final labels
         final_labels = {
             "im_file": mosaic_labels[0]["im_file"],
@@ -817,9 +813,13 @@ class Mosaic(BaseMixTransform):
             "instances": Instances.concatenate(instances, axis=0),
             "mosaic_border": self.border,
         }
-        final_labels["instances"].clip(imgsz, imgsz)
-        good = final_labels["instances"].remove_zero_area_boxes()
+        loc_good = final_labels["instances"].clip(imgsz, imgsz)
+        good = loc_good if loc_good is not None else final_labels["instances"].remove_zero_area_boxes()
         final_labels["cls"] = final_labels["cls"][good]
+        if use_locations:
+            final_labels["radii"] = np.concatenate(radii, 0)[good]
+        if "texts" in mosaic_labels[0]:
+            final_labels["texts"] = mosaic_labels[0]["texts"]
         return final_labels
 
 
@@ -878,18 +878,131 @@ class MixUp(BaseMixTransform):
         labels["img"] = (labels["img"] * r + labels2["img"] * (1 - r)).astype(np.uint8)
         labels["instances"] = Instances.concatenate([labels["instances"], labels2["instances"]], axis=0)
         labels["cls"] = np.concatenate([labels["cls"], labels2["cls"]], 0)
-
-        if self.dataset.use_locations:
+        if "radii" in labels:
             labels["radii"] = np.concatenate([labels["radii"], labels2["radii"]], 0)
+        return labels
 
+
+class CutMix(BaseMixTransform):
+    """Apply CutMix augmentation to image datasets as described in the paper https://arxiv.org/abs/1905.04899.
+
+    CutMix combines two images by replacing a random rectangular region of one image with the corresponding region from
+    another image, and adjusts the labels proportionally to the area of the mixed region.
+
+    Attributes:
+        dataset (Any): The dataset to which CutMix augmentation will be applied.
+        pre_transform (Callable | None): Optional transform to apply before CutMix.
+        p (float): Probability of applying CutMix augmentation.
+        beta (float): Beta distribution parameter for sampling the mixing ratio.
+        num_areas (int): Number of areas to try to cut and mix.
+
+    Methods:
+        _mix_transform: Apply CutMix augmentation to the input labels.
+        _rand_bbox: Generate random bounding box coordinates for the cut region.
+
+    Examples:
+        >>> from ultralytics.data.augment import CutMix
+        >>> dataset = YourDataset(...)  # Your image dataset
+        >>> cutmix = CutMix(dataset, p=0.5)
+        >>> augmented_labels = cutmix(original_labels)
+    """
+
+    def __init__(self, dataset, pre_transform=None, p: float = 0.0, beta: float = 1.0, num_areas: int = 3) -> None:
+        """Initialize the CutMix augmentation object.
+
+        Args:
+            dataset (Any): The dataset to which CutMix augmentation will be applied.
+            pre_transform (Callable | None): Optional transform to apply before CutMix.
+            p (float): Probability of applying CutMix augmentation.
+            beta (float): Beta distribution parameter for sampling the mixing ratio.
+            num_areas (int): Number of areas to try to cut and mix.
+        """
+        super().__init__(dataset=dataset, pre_transform=pre_transform, p=p)
+        self.beta = beta
+        self.num_areas = num_areas
+
+    def _rand_bbox(self, width: int, height: int) -> tuple[int, int, int, int]:
+        """Generate random bounding box coordinates for the cut region.
+
+        Args:
+            width (int): Width of the image.
+            height (int): Height of the image.
+
+        Returns:
+            (tuple[int]): (x1, y1, x2, y2) coordinates of the bounding box.
+        """
+        # Sample mixing ratio from Beta distribution
+        lam = np.random.beta(self.beta, self.beta)
+
+        cut_ratio = np.sqrt(1.0 - lam)
+        cut_w = int(width * cut_ratio)
+        cut_h = int(height * cut_ratio)
+
+        # Random center
+        cx = np.random.randint(width)
+        cy = np.random.randint(height)
+
+        # Bounding box coordinates
+        x1 = np.clip(cx - cut_w // 2, 0, width)
+        y1 = np.clip(cy - cut_h // 2, 0, height)
+        x2 = np.clip(cx + cut_w // 2, 0, width)
+        y2 = np.clip(cy + cut_h // 2, 0, height)
+
+        return x1, y1, x2, y2
+
+    def _mix_transform(self, labels: dict[str, Any]) -> dict[str, Any]:
+        """Apply CutMix augmentation to the input labels.
+
+        Args:
+            labels (dict[str, Any]): A dictionary containing the original image and label information.
+
+        Returns:
+            (dict[str, Any]): A dictionary containing the mixed image and adjusted labels.
+
+        Examples:
+            >>> cutter = CutMix(dataset)
+            >>> mixed_labels = cutter._mix_transform(labels)
+        """
+        # Get a random second image
+        h, w = labels["img"].shape[:2]
+
+        cut_areas = np.asarray([self._rand_bbox(w, h) for _ in range(self.num_areas)], dtype=np.float32)
+        ioa1 = bbox_ioa(cut_areas, labels["instances"].bboxes)  # (self.num_areas, num_boxes)
+        idx = np.nonzero(ioa1.sum(axis=1) <= 0)[0]
+        if len(idx) == 0:
+            return labels
+
+        labels2 = labels.pop("mix_labels")[0]
+        area = cut_areas[np.random.choice(idx)]  # randomly select one
+        ioa2 = bbox_ioa(area[None], labels2["instances"].bboxes).squeeze(0)
+        indexes2 = np.nonzero(ioa2 >= (0.01 if len(labels["instances"].segments) else 0.1))[0]
+        if len(indexes2) == 0:
+            return labels
+
+        instances2 = labels2["instances"][indexes2]
+        instances2.convert_bbox("xyxy")
+        instances2.denormalize(w, h)
+
+        # Apply CutMix
+        x1, y1, x2, y2 = area.astype(np.int32)
+        labels["img"][y1:y2, x1:x2] = labels2["img"][y1:y2, x1:x2]
+
+        # Restrain instances2 to the random bounding border
+        instances2.add_padding(-x1, -y1)
+        instances2.clip(x2 - x1, y2 - y1)
+        instances2.add_padding(x1, y1)
+
+        labels["cls"] = np.concatenate([labels["cls"], labels2["cls"][indexes2]], axis=0)
+        labels["instances"] = Instances.concatenate([labels["instances"], instances2], axis=0)
         return labels
 
 
 class RandomPerspective:
-    """
-    Implements random perspective and affine transformations on images and corresponding bounding boxes, segments, and
-    keypoints. These transformations include rotation, translation, scaling, and shearing. The class also offers the
-    option to apply these transformations conditionally with a specified probability.
+    """Implement random perspective and affine transformations on images and corresponding annotations.
+
+    This class applies random rotations, translations, scaling, shearing, and perspective transformations to images and
+    their associated bounding boxes, segments, and keypoints. It can be used as part of an augmentation pipeline for
+    object detection and instance segmentation tasks.
 
     Attributes:
         degrees (float): Maximum absolute degree range for random rotations.
@@ -1032,8 +1145,6 @@ class RandomPerspective:
             >>> M = torch.eye(3)
             >>> transformed_bboxes = apply_bboxes(bboxes, M)
         """
-        if bboxes is None:
-            return None
         n = len(bboxes)
         if n == 0:
             return bboxes
@@ -1048,30 +1159,27 @@ class RandomPerspective:
         y = xy[:, [1, 3, 5, 7]]
         return np.concatenate((x.min(1), y.min(1), x.max(1), y.max(1)), dtype=bboxes.dtype).reshape(4, n).T
 
-    def apply_segments(self, segments, M):
-        """
-        Apply affine transformation to point labels.
+    def apply_locations(self, locations: np.ndarray, M: np.ndarray) -> np.ndarray:
+        """Apply affine transformation to point locations.
 
         Args:
-            points (ndarray): Array of points with shape (N, 2) or (N, 3) if visibility is included.
-            M (ndarray): Affine transformation matrix.
+            locations (np.ndarray): Point locations with shape (N, 2).
+            M (np.ndarray): Affine transformation matrix with shape (3, 3).
 
         Returns:
-            new_points (ndarray): Transformed points with shape (N, 2) or (N, 3).
+            (np.ndarray): Transformed locations with shape (N, 2).
         """
-        if locations.shape[0] == 0:
+        if len(locations) == 0:
             return locations
 
-        # Reshape to (N, 3) for homogeneous coordinates
-        xy = np.ones((locations.shape[0], 3), dtype=locations.dtype)
-        xy[:, :2] = locations  # Assign (x, y) coordinates
-
-        # Apply transformation
-        xy = xy @ M.T  # Matrix multiplication
-        xy = xy[:, :2] / xy[:, 2:3]  # Normalize if perspective transformation
-
+        xy = np.ones((len(locations), 3), dtype=locations.dtype)
+        xy[:, :2] = locations
+        xy = xy @ M.T  # transform
+        if self.perspective:
+            xy = xy[:, :2] / xy[:, 2:3]
+        else:
+            xy = xy[:, :2]
         return xy
-
 
     def apply_segments(self, segments: np.ndarray, M: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """Apply affine transformations to segments and generate new bounding boxes.
@@ -1149,7 +1257,33 @@ class RandomPerspective:
         accordingly.
 
         Args:
-            labels (dict): a dict of `bboxes`, `segments`, `keypoints`.
+            labels (dict[str, Any]): A dictionary containing image data and annotations.
+
+        Returns:
+            (dict[str, Any]): Transformed labels dictionary containing:
+                - 'img' (np.ndarray): The transformed image.
+                - 'cls' (np.ndarray): Updated class labels.
+                - 'instances' (Instances): Updated object instances.
+                - 'resized_shape' (tuple[int, int]): New image shape after transformation.
+
+        Examples:
+            >>> transform = RandomPerspective()
+            >>> image = np.random.randint(0, 255, (640, 640, 3), dtype=np.uint8)
+            >>> labels = {
+            ...     "img": image,
+            ...     "cls": np.array([0, 1, 2]),
+            ...     "instances": Instances(bboxes=np.array([[10, 10, 50, 50], [100, 100, 150, 150]])),
+            ... }
+            >>> result = transform(labels)
+            >>> assert result["img"].shape[:2] == result["resized_shape"]
+
+        Notes:
+            'labels' arg must include:
+                - 'img' (np.ndarray): The input image.
+                - 'cls' (np.ndarray): Class labels.
+                - 'instances' (Instances): Object instances with bounding boxes, segments, and keypoints.
+            May include:
+                - 'mosaic_border' (tuple[int, int]): Border size for mosaic augmentation.
         """
         if self.pre_transform and "mosaic_border" not in labels:
             labels = self.pre_transform(labels)
@@ -1159,9 +1293,7 @@ class RandomPerspective:
         cls = labels["cls"]
         instances = labels.pop("instances")
         # Make sure the coord formats are right
-        if instances.bboxes is not None:
-            instances.convert_bbox(format="xyxy")
-            
+        instances.convert_bbox(format="xyxy")
         instances.denormalize(*img.shape[:2][::-1])
 
         border = labels.pop("mosaic_border", self.border)
@@ -1171,38 +1303,37 @@ class RandomPerspective:
         img, M, scale = self.affine_transform(img, border)
 
         bboxes = self.apply_bboxes(instances.bboxes, M) if instances.bboxes is not None else None
-
         locations = instances.locations
         segments = instances.segments
         keypoints = instances.keypoints
         # Update bboxes if there are segments.
-        if segments is not None and len(segments):
+        if len(segments):
             bboxes, segments = self.apply_segments(segments, M)
         if locations is not None:
             locations = self.apply_locations(locations, M)
+
         if keypoints is not None:
             keypoints = self.apply_keypoints(keypoints, M)
-        new_instances = Instances(bboxes, segments, keypoints, bbox_format="xyxy", normalized=False)
+        new_instances = Instances(bboxes, locations, segments, keypoints, bbox_format="xyxy", normalized=False)
         # Clip
-        new_instances.clip(*self.size)
+        loc_good = new_instances.clip(*self.size)
 
         # Filter instances
-        instances.scale(scale_w=scale, scale_h=scale, bbox_only=True)
-        # Make the bboxes have the same scale with new_bboxes
         if instances.bboxes is not None:
+            instances.scale(scale_w=scale, scale_h=scale, bbox_only=True)
+            # Make the bboxes have the same scale with new_bboxes
             i = self.box_candidates(
                 box1=instances.bboxes.T, box2=new_instances.bboxes.T, area_thr=0.01 if len(segments) else 0.10
             )
             labels["instances"] = new_instances[i]
             labels["cls"] = cls[i]
-        elif instances.locations is not None:
-            labels["cls"] = cls[good]
-            labels["radii"] = labels["radii"][good]
-            labels["instances"] = new_instances
         else:
+            if loc_good is None:
+                loc_good = np.ones(len(new_instances), dtype=bool)
             labels["instances"] = new_instances
-            labels["cls"] = cls
-
+            labels["cls"] = cls[loc_good]
+            if "radii" in labels:
+                labels["radii"] = labels["radii"][loc_good]
         labels["img"] = img
         labels["resized_shape"] = img.shape[:2]
         return labels
@@ -1331,12 +1462,29 @@ class RandomHSV:
 class RandomFlip:
     """Apply a random horizontal or vertical flip to an image with a given probability.
 
-    Also updates any instances (bounding boxes, keypoints, etc.) accordingly.
+    This class performs random image flipping and updates corresponding instance annotations such as bounding boxes and
+    keypoints.
+
+    Attributes:
+        p (float): Probability of applying the flip. Must be between 0 and 1.
+        direction (str): Direction of flip, either 'horizontal' or 'vertical'.
+        flip_idx (array-like): Index mapping for flipping keypoints, if applicable.
+
+    Methods:
+        __call__: Apply the random flip transformation to an image and its annotations.
+
+    Examples:
+        >>> transform = RandomFlip(p=0.5, direction="horizontal")
+        >>> result = transform({"img": image, "instances": instances})
+        >>> flipped_image = result["img"]
+        >>> flipped_instances = result["instances"]
     """
 
-    def __init__(self, p=0.5, direction="horizontal", flip_idx=None) -> None:
-        """
-        Initializes the RandomFlip class with probability and direction.
+    def __init__(self, p: float = 0.5, direction: str = "horizontal", flip_idx: list[int] | None = None) -> None:
+        """Initialize the RandomFlip class with probability and direction.
+
+        This class applies a random horizontal or vertical flip to an image with a given probability. It also updates
+        any instances (bounding boxes, keypoints, etc.) accordingly.
 
         Args:
             p (float): The probability of applying the flip. Must be between 0 and 1.
@@ -1353,13 +1501,17 @@ class RandomFlip:
         self.direction = direction
         self.flip_idx = flip_idx
 
-    def __call__(self, labels):
-        """
-        Applies random flip to an image and updates any instances like bounding boxes or keypoints accordingly.
+    def __call__(self, labels: dict[str, Any]) -> dict[str, Any]:
+        """Apply random flip to an image and update any instances like bounding boxes or keypoints accordingly.
+
+        This method randomly flips the input image either horizontally or vertically based on the initialized
+        probability and direction. It also updates the corresponding instances (bounding boxes, keypoints) to match the
+        flipped image.
 
         Args:
-            labels (dict): A dictionary containing the keys 'img' and 'instances'. 'img' is the image to be flipped.
-                           'instances' is an object containing bounding boxes and optionally keypoints.
+            labels (dict[str, Any]): A dictionary containing the following keys:
+                - 'img' (np.ndarray): The image to be flipped.
+                - 'instances' (ultralytics.utils.instance.Instances): Object containing boxes and optionally keypoints.
 
         Returns:
             (dict[str, Any]): The same dictionary with the flipped image and updated instances:
@@ -1373,8 +1525,7 @@ class RandomFlip:
         """
         img = labels["img"]
         instances = labels.pop("instances")
-        if instances.bboxes is not None: 
-            instances.convert_bbox(format="xywh")
+        instances.convert_bbox(format="xywh")
         h, w = img.shape[:2]
         h = 1 if instances.normalized else h
         w = 1 if instances.normalized else w
@@ -1396,7 +1547,28 @@ class RandomFlip:
 
 
 class LetterBox:
-    """Resize image and padding for detection, instance segmentation, pose."""
+    """Resize image and padding for detection, instance segmentation, pose.
+
+    This class resizes and pads images to a specified shape while preserving aspect ratio. It also updates corresponding
+    labels and bounding boxes.
+
+    Attributes:
+        new_shape (tuple): Target shape (height, width) for resizing.
+        auto (bool): Whether to use minimum rectangle.
+        scale_fill (bool): Whether to stretch the image to new_shape.
+        scaleup (bool): Whether to allow scaling up. If False, only scale down.
+        stride (int): Stride for rounding padding.
+        center (bool): Whether to center the image or align to top-left.
+
+    Methods:
+        __call__: Resize and pad image, update labels and bounding boxes.
+
+    Examples:
+        >>> transform = LetterBox(new_shape=(640, 640))
+        >>> result = transform(labels)
+        >>> resized_img = result["img"]
+        >>> updated_instances = result["instances"]
+    """
 
     def __init__(
         self,
@@ -1511,8 +1683,29 @@ class LetterBox:
         else:
             return img
 
-    def _update_labels(self, labels, ratio, padw, padh):
-        """Update labels."""
+    @staticmethod
+    def _update_labels(labels: dict[str, Any], ratio: tuple[float, float], padw: float, padh: float) -> dict[str, Any]:
+        """Update labels after applying letterboxing to an image.
+
+        This method modifies the bounding box coordinates of instances in the labels to account for resizing and padding
+        applied during letterboxing.
+
+        Args:
+            labels (dict[str, Any]): A dictionary containing image labels and instances.
+            ratio (tuple[float, float]): Scaling ratios (width, height) applied to the image.
+            padw (float): Padding width added to the image.
+            padh (float): Padding height added to the image.
+
+        Returns:
+            (dict[str, Any]): Updated labels dictionary with modified instance coordinates.
+
+        Examples:
+            >>> letterbox = LetterBox(new_shape=(640, 640))
+            >>> labels = {"instances": Instances(...)}
+            >>> ratio = (0.5, 0.5)
+            >>> padw, padh = 10, 20
+            >>> updated_labels = letterbox._update_labels(labels, ratio, padw, padh)
+        """
         labels["instances"].convert_bbox(format="xyxy")
         labels["instances"].denormalize(*labels["img"].shape[:2][::-1])
         labels["instances"].scale(*ratio)
@@ -1554,25 +1747,39 @@ class CopyPaste(BaseMixTransform):
         labels2 = labels["mix_labels"][0]
         return self._transform(labels, labels2)
 
-    def __call__(self, labels):
-        """
-        Applies the Copy-Paste augmentation to the given image and instances.
+    def __call__(self, labels: dict[str, Any]) -> dict[str, Any]:
+        """Apply Copy-Paste augmentation to an image and its labels."""
+        if len(labels["instances"].segments) == 0 or self.p == 0:
+            return labels
+        if self.mode == "flip":
+            return self._transform(labels)
 
-        Args:
-            labels (dict): A dictionary containing:
-                           - 'img': The image to augment.
-                           - 'cls': Class labels associated with the instances.
-                           - 'instances': Object containing bounding boxes, and optionally, keypoints and segments.
+        # Get index of one or three other images
+        indexes = self.get_indexes()
+        if isinstance(indexes, int):
+            indexes = [indexes]
 
-        Returns:
-            (dict): Dict with augmented image and updated instances under the 'img', 'cls', and 'instances' keys.
+        # Get images information will be used for Mosaic or MixUp
+        mix_labels = [self.dataset.get_image_and_label(i) for i in indexes]
 
-        Notes:
-            1. Instances are expected to have 'segments' as one of their attributes for this augmentation to work.
-            2. This method modifies the input dictionary 'labels' in place.
-        """
-        im = labels["img"]
-        cls = labels["cls"]
+        if self.pre_transform is not None:
+            for i, data in enumerate(mix_labels):
+                mix_labels[i] = self.pre_transform(data)
+        labels["mix_labels"] = mix_labels
+
+        # Update cls and texts
+        labels = self._update_label_text(labels)
+        # Mosaic or MixUp
+        labels = self._mix_transform(labels)
+        labels.pop("mix_labels", None)
+        return labels
+
+    def _transform(self, labels1: dict[str, Any], labels2: dict[str, Any] = {}) -> dict[str, Any]:
+        """Apply Copy-Paste augmentation to combine objects from another image into the current image."""
+        im = labels1["img"]
+        if "mosaic_border" not in labels1:
+            im = im.copy()  # avoid modifying original non-mosaic image
+        cls = labels1["cls"]
         h, w = im.shape[:2]
         instances = labels1.pop("instances")
         instances.convert_bbox(format="xyxy")
@@ -1630,11 +1837,23 @@ class Albumentations:
         - Some transforms are applied with very low probability (0.01) by default.
     """
 
-    def __init__(self, p=1.0):
-        """Initialize the transform object for YOLO bbox formatted params."""
+    def __init__(self, p: float = 1.0, transforms: list | None = None) -> None:
+        """Initialize the Albumentations transform object for YOLO bbox formatted parameters.
+
+        This class applies various image augmentations using the Albumentations library, including Blur, Median Blur,
+        conversion to grayscale, Contrast Limited Adaptive Histogram Equalization, random changes of brightness and
+        contrast, RandomGamma, and image quality reduction through compression.
+
+        Args:
+            p (float): Probability of applying the augmentations. Must be between 0 and 1.
+            transforms (list, optional): List of custom Albumentations transforms. If None, uses default transforms.
+
+        Raises:
+            ImportError: If the Albumentations package is not installed.
+            Exception: For any other errors during initialization.
+        """
         self.p = p
         self.transform = None
-        self.use_locations = use_locations
         prefix = colorstr("albumentations: ")
 
         try:
@@ -1645,18 +1864,75 @@ class Albumentations:
 
             check_version(A.__version__, "1.0.3", hard=True)  # version requirement
 
-            # Transforms
-            T = [
-                A.Blur(p=0.01),
-                A.MedianBlur(p=0.01),
-                A.ToGray(p=0.01),
-                A.CLAHE(p=0.01),
-                A.RandomBrightnessContrast(p=0.0),
-                A.RandomGamma(p=0.0),
-                A.ImageCompression(quality_lower=75, p=0.0),
-            ]
-            self.transform = A.Compose(T, bbox_params=A.BboxParams(format="yolo", label_fields=["class_labels"]))
+            # List of possible spatial transforms
+            spatial_transforms = {
+                "Affine",
+                "BBoxSafeRandomCrop",
+                "CenterCrop",
+                "CoarseDropout",
+                "Crop",
+                "CropAndPad",
+                "CropNonEmptyMaskIfExists",
+                "D4",
+                "ElasticTransform",
+                "Flip",
+                "GridDistortion",
+                "GridDropout",
+                "HorizontalFlip",
+                "Lambda",
+                "LongestMaxSize",
+                "MaskDropout",
+                "MixUp",
+                "Morphological",
+                "NoOp",
+                "OpticalDistortion",
+                "PadIfNeeded",
+                "Perspective",
+                "PiecewiseAffine",
+                "PixelDropout",
+                "RandomCrop",
+                "RandomCropFromBorders",
+                "RandomGridShuffle",
+                "RandomResizedCrop",
+                "RandomRotate90",
+                "RandomScale",
+                "RandomSizedBBoxSafeCrop",
+                "RandomSizedCrop",
+                "Resize",
+                "Rotate",
+                "SafeRotate",
+                "ShiftScaleRotate",
+                "SmallestMaxSize",
+                "Transpose",
+                "VerticalFlip",
+                "XYMasking",
+            }  # from https://albumentations.ai/docs/getting_started/transforms_and_targets/#spatial-level-transforms
 
+            # Transforms, use custom transforms if provided, otherwise use defaults
+            T = (
+                [
+                    A.Blur(p=0.01),
+                    A.MedianBlur(p=0.01),
+                    A.ToGray(p=0.01),
+                    A.CLAHE(p=0.01),
+                    A.RandomBrightnessContrast(p=0.0),
+                    A.RandomGamma(p=0.0),
+                    A.ImageCompression(quality_range=(75, 100), p=0.0),
+                ]
+                if transforms is None
+                else transforms
+            )
+
+            # Compose transforms
+            self.contains_spatial = any(transform.__class__.__name__ in spatial_transforms for transform in T)
+            self.transform = (
+                A.Compose(T, bbox_params=A.BboxParams(format="yolo", label_fields=["class_labels"]))
+                if self.contains_spatial
+                else A.Compose(T)
+            )
+            if hasattr(self.transform, "set_random_seed"):
+                # Required for deterministic transforms in albumentations>=1.4.21
+                self.transform.set_random_seed(torch.initial_seed())
             LOGGER.info(prefix + ", ".join(f"{x}".replace("always_apply=False, ", "") for x in T if x.p))
         except ImportError:  # package not installed, skip
             pass
@@ -1697,47 +1973,70 @@ class Albumentations:
             return labels
 
         im = labels["img"]
-        cls = labels["cls"]
-        if len(cls):
-            labels["instances"].convert_bbox("xywh")
-            labels["instances"].normalize(*im.shape[:2][::-1])
-            bboxes = labels["instances"].bboxes
-            # TODO: add supports of segments and keypoints
-            if self.transform and random.random() < self.p:
+        if im.shape[2] != 3:  # Only apply Albumentation on 3-channel images
+            return labels
+
+        if self.contains_spatial:
+            cls = labels["cls"]
+            if len(cls) and labels["instances"].bboxes is not None:
+                labels["instances"].convert_bbox("xywh")
+                labels["instances"].normalize(*im.shape[:2][::-1])
+                bboxes = labels["instances"].bboxes
+                # TODO: add supports of segments and keypoints
                 new = self.transform(image=im, bboxes=bboxes, class_labels=cls)  # transformed
                 if len(new["class_labels"]) > 0:  # skip update if no bbox in new im
                     labels["img"] = new["image"]
-                    labels["cls"] = np.array(new["class_labels"])
+                    labels["cls"] = np.array(new["class_labels"]).reshape(-1, 1)
                     bboxes = np.array(new["bboxes"], dtype=np.float32)
-            labels["instances"].update(bboxes=bboxes)
+                labels["instances"].update(bboxes=bboxes)
+        else:
+            labels["img"] = self.transform(image=labels["img"])["image"]  # transformed
+
         return labels
 
 
 class Format:
-    """
-    Formats image annotations for object detection, instance segmentation, and pose estimation tasks. The class
-    standardizes the image and instance annotations to be used by the `collate_fn` in PyTorch DataLoader.
+    """A class for formatting image annotations for object detection, instance segmentation, and pose estimation tasks.
+
+    This class standardizes image and instance annotations to be used by the `collate_fn` in PyTorch DataLoader.
 
     Attributes:
-        bbox_format (str): Format for bounding boxes. Default is 'xywh'.
-        normalize (bool): Whether to normalize bounding boxes. Default is True.
-        return_mask (bool): Return instance masks for segmentation. Default is False.
-        return_keypoint (bool): Return keypoints for pose estimation. Default is False.
-        mask_ratio (int): Downsample ratio for masks. Default is 4.
-        mask_overlap (bool): Whether to overlap masks. Default is True.
-        batch_idx (bool): Keep batch indexes. Default is True.
+        bbox_format (str): Format for bounding boxes. Options are 'xywh' or 'xyxy'.
+        normalize (bool): Whether to normalize bounding boxes.
+        return_mask (bool): Whether to return instance masks for segmentation.
+        return_keypoint (bool): Whether to return keypoints for pose estimation.
+        return_obb (bool): Whether to return oriented bounding boxes.
+        return_locations (bool): Whether to return locations for localization tasks.
+        mask_ratio (int): Downsample ratio for masks.
+        mask_overlap (bool): Whether to overlap masks.
+        batch_idx (bool): Whether to keep batch indexes.
+        bgr (float): The probability to return BGR images.
+
+    Methods:
+        __call__: Format labels dictionary with image, classes, bounding boxes, and optionally masks and keypoints.
+        _format_img: Convert image from Numpy array to PyTorch tensor.
+        _format_segments: Convert polygon points to bitmap masks.
+
+    Examples:
+        >>> formatter = Format(bbox_format="xywh", normalize=True, return_mask=True)
+        >>> formatted_labels = formatter(labels)
+        >>> img = formatted_labels["img"]
+        >>> bboxes = formatted_labels["bboxes"]
+        >>> masks = formatted_labels["masks"]
     """
 
     def __init__(
         self,
-        bbox_format="xywh",
-        normalize=True,
-        return_mask=False,
-        return_keypoint=False,
-        return_obb=False,
-        mask_ratio=4,
-        mask_overlap=True,
-        batch_idx=True,
+        bbox_format: str = "xywh",
+        normalize: bool = True,
+        return_mask: bool = False,
+        return_keypoint: bool = False,
+        return_obb: bool = False,
+        return_locations: bool = False,
+        mask_ratio: int = 4,
+        mask_overlap: bool = True,
+        batch_idx: bool = True,
+        bgr: float = 0.0,
     ):
         """Initialize the Format class with given parameters for image and instance annotation formatting.
 
@@ -1750,7 +2049,6 @@ class Format:
             return_mask (bool): If True, returns instance masks for segmentation tasks.
             return_keypoint (bool): If True, returns keypoints for pose estimation tasks.
             return_obb (bool): If True, returns oriented bounding boxes.
-            return_locations (bool): If True, returns locations and radii for locate tasks.
             mask_ratio (int): Downsample ratio for masks.
             mask_overlap (bool): If True, allows mask overlap.
             batch_idx (bool): If True, keeps batch indexes.
@@ -1758,7 +2056,6 @@ class Format:
         """
         self.bbox_format = bbox_format
         self.normalize = normalize
-        self.return_locations = return_locations
         self.return_mask = return_mask  # set False when training detection only
         self.return_keypoint = return_keypoint
         self.return_obb = return_obb
@@ -1768,14 +2065,39 @@ class Format:
         self.batch_idx = batch_idx  # keep the batch indexes
         self.bgr = bgr
 
-    def __call__(self, labels):
-        """Return formatted image, classes, bounding boxes & keypoints to be used by 'collate_fn'."""
+    def __call__(self, labels: dict[str, Any]) -> dict[str, Any]:
+        """Format image annotations for object detection, instance segmentation, and pose estimation tasks.
+
+        This method standardizes the image and instance annotations to be used by the `collate_fn` in PyTorch
+        DataLoader. It processes the input labels dictionary, converting annotations to the specified format and
+        applying normalization if required.
+
+        Args:
+            labels (dict[str, Any]): A dictionary containing image and annotation data with the following keys:
+                - 'img': The input image as a numpy array.
+                - 'cls': Class labels for instances.
+                - 'instances': An Instances object containing bounding boxes, segments, and keypoints.
+
+        Returns:
+            (dict[str, Any]): A dictionary with formatted data, including:
+                - 'img': Formatted image tensor.
+                - 'cls': Class label's tensor.
+                - 'bboxes': Bounding boxes tensor in the specified format.
+                - 'masks': Instance masks tensor (if return_mask is True).
+                - 'keypoints': Keypoints tensor (if return_keypoint is True).
+                - 'batch_idx': Batch index tensor (if batch_idx is True).
+
+        Examples:
+            >>> formatter = Format(bbox_format="xywh", normalize=True, return_mask=True)
+            >>> labels = {"img": np.random.rand(640, 640, 3), "cls": np.array([0, 1]), "instances": Instances(...)}
+            >>> formatted_labels = formatter(labels)
+            >>> print(formatted_labels.keys())
+        """
         img = labels.pop("img")
         h, w = img.shape[:2]
         cls = labels.pop("cls")
         instances = labels.pop("instances")
-        if instances.bboxes is not None:
-            instances.convert_bbox(format=self.bbox_format)
+        instances.convert_bbox(format=self.bbox_format)
         instances.denormalize(w, h)
         nl = len(instances)
 
@@ -1804,8 +2126,21 @@ class Format:
             labels["masks"] = masks
             labels["sem_masks"] = sem_masks.float()
         labels["img"] = self._format_img(img)
-        labels["cls"] = torch.from_numpy(cls) if nl else torch.zeros(nl)
-        labels["bboxes"] = torch.from_numpy(instances.bboxes) if nl else torch.zeros((nl, 4))
+        labels["cls"] = torch.from_numpy(cls) if nl else torch.zeros(nl, 1)
+        if nl:
+            labels["bboxes"] = (
+                torch.from_numpy(instances.bboxes) if instances.bboxes is not None else torch.zeros((nl, 4))
+            )
+        else:
+            labels["bboxes"] = torch.zeros((nl, 4))
+        if self.return_locations:
+            locations = (
+                torch.from_numpy(instances.locations) if instances.locations is not None else torch.zeros((0, 2))
+            )
+            if self.normalize and locations.numel():
+                locations[:, 0] /= w
+                locations[:, 1] /= h
+            labels["locations"] = locations
         if self.return_keypoint:
             labels["keypoints"] = (
                 torch.empty(0, 3) if instances.keypoints is None else torch.from_numpy(instances.keypoints)
@@ -1889,22 +2224,274 @@ class Format:
         return masks, instances, cls
 
 
-def v8_transforms(dataset, imgsz, hyp, stretch=False):
-    """Convert images to a size suitable for YOLOv8 training."""
-    pre_transform = Compose(
-        [
-            Mosaic(dataset, imgsz=imgsz, p=hyp.mosaic),
-            CopyPaste(p=hyp.copy_paste),
-            RandomPerspective(
-                degrees=hyp.degrees,
-                translate=hyp.translate,
-                scale=hyp.scale,
-                shear=hyp.shear,
-                perspective=hyp.perspective,
-                pre_transform=None if stretch else LetterBox(new_shape=(imgsz, imgsz)),
-            ),
-        ]
+class LoadVisualPrompt:
+    """Create visual prompts from bounding boxes or masks for model input."""
+
+    def __init__(self, scale_factor: float = 1 / 8) -> None:
+        """Initialize the LoadVisualPrompt with a scale factor.
+
+        Args:
+            scale_factor (float): Factor to scale the input image dimensions.
+        """
+        self.scale_factor = scale_factor
+
+    @staticmethod
+    def make_mask(boxes: torch.Tensor, h: int, w: int) -> torch.Tensor:
+        """Create binary masks from bounding boxes.
+
+        Args:
+            boxes (torch.Tensor): Bounding boxes in xyxy format, shape: (N, 4).
+            h (int): Height of the mask.
+            w (int): Width of the mask.
+
+        Returns:
+            (torch.Tensor): Binary masks with shape (N, h, w).
+        """
+        x1, y1, x2, y2 = torch.chunk(boxes[:, :, None], 4, 1)  # x1 shape(n,1,1)
+        r = torch.arange(w)[None, None, :]  # rows shape(1,1,w)
+        c = torch.arange(h)[None, :, None]  # cols shape(1,h,1)
+
+        return (r >= x1) * (r < x2) * (c >= y1) * (c < y2)
+
+    def __call__(self, labels: dict[str, Any]) -> dict[str, Any]:
+        """Process labels to create visual prompts.
+
+        Args:
+            labels (dict[str, Any]): Dictionary containing image data and annotations.
+
+        Returns:
+            (dict[str, Any]): Updated labels with visual prompts added.
+        """
+        imgsz = labels["img"].shape[1:]
+        bboxes, masks = None, None
+        if "bboxes" in labels:
+            bboxes = labels["bboxes"]
+            bboxes = xywh2xyxy(bboxes) * torch.tensor(imgsz)[[1, 0, 1, 0]]  # denormalize boxes
+
+        cls = labels["cls"].squeeze(-1).to(torch.int)
+        visuals = self.get_visuals(cls, imgsz, bboxes=bboxes, masks=masks)
+        labels["visuals"] = visuals
+        return labels
+
+    def get_visuals(
+        self,
+        category: int | np.ndarray | torch.Tensor,
+        shape: tuple[int, int],
+        bboxes: np.ndarray | torch.Tensor = None,
+        masks: np.ndarray | torch.Tensor = None,
+    ) -> torch.Tensor:
+        """Generate visual masks based on bounding boxes or masks.
+
+        Args:
+            category (int | np.ndarray | torch.Tensor): The category labels for the objects.
+            shape (tuple[int, int]): The shape of the image (height, width).
+            bboxes (np.ndarray | torch.Tensor, optional): Bounding boxes for the objects, xyxy format.
+            masks (np.ndarray | torch.Tensor, optional): Masks for the objects.
+
+        Returns:
+            (torch.Tensor): A tensor containing the visual masks for each category.
+
+        Raises:
+            ValueError: If neither bboxes nor masks are provided.
+        """
+        masksz = (int(shape[0] * self.scale_factor), int(shape[1] * self.scale_factor))
+        if bboxes is not None:
+            if isinstance(bboxes, np.ndarray):
+                bboxes = torch.from_numpy(bboxes)
+            bboxes *= self.scale_factor
+            masks = self.make_mask(bboxes, *masksz).float()
+        elif masks is not None:
+            if isinstance(masks, np.ndarray):
+                masks = torch.from_numpy(masks)  # (N, H, W)
+            masks = F.interpolate(masks.unsqueeze(1), masksz, mode="nearest").squeeze(1).float()
+        else:
+            raise ValueError("LoadVisualPrompt must have bboxes or masks in the label")
+        if not isinstance(category, torch.Tensor):
+            category = torch.tensor(category, dtype=torch.int)
+        cls_unique, inverse_indices = torch.unique(category, sorted=True, return_inverse=True)
+        # NOTE: `cls` indices from RandomLoadText should be continuous.
+        # if len(cls_unique):
+        #     assert len(cls_unique) == cls_unique[-1] + 1, (
+        #         f"Expected a continuous range of class indices, but got {cls_unique}"
+        #     )
+        visuals = torch.zeros(cls_unique.shape[0], *masksz)
+        for idx, mask in zip(inverse_indices, masks):
+            visuals[idx] = torch.logical_or(visuals[idx], mask)
+        return visuals
+
+
+class RandomLoadText:
+    """Randomly sample positive and negative texts and update class indices accordingly.
+
+    This class is responsible for sampling texts from a given set of class texts, including both positive (present in
+    the image) and negative (not present in the image) samples. It updates the class indices to reflect the sampled
+    texts and can optionally pad the text list to a fixed length.
+
+    Attributes:
+        prompt_format (str): Format string for text prompts.
+        neg_samples (tuple[int, int]): Range for randomly sampling negative texts.
+        max_samples (int): Maximum number of different text samples in one image.
+        padding (bool): Whether to pad texts to max_samples.
+        padding_value (str): The text used for padding when padding is True.
+
+    Methods:
+        __call__: Process the input labels and return updated classes and texts.
+
+    Examples:
+        >>> loader = RandomLoadText(prompt_format="Object: {}", neg_samples=(5, 10), max_samples=20)
+        >>> labels = {"cls": [0, 1, 2], "texts": [["cat"], ["dog"], ["bird"]], "instances": [...]}
+        >>> updated_labels = loader(labels)
+        >>> print(updated_labels["texts"])
+        ['Object: cat', 'Object: dog', 'Object: bird', 'Object: elephant', 'Object: car']
+    """
+
+    def __init__(
+        self,
+        prompt_format: str = "{}",
+        neg_samples: tuple[int, int] = (80, 80),
+        max_samples: int = 80,
+        padding: bool = False,
+        padding_value: list[str] = [""],
+    ) -> None:
+        """Initialize the RandomLoadText class for randomly sampling positive and negative texts.
+
+        This class is designed to randomly sample positive texts and negative texts, and update the class indices
+        accordingly to the number of samples. It can be used for text-based object detection tasks.
+
+        Args:
+            prompt_format (str): Format string for the prompt. The format string should contain a single pair of curly
+                braces {} where the text will be inserted.
+            neg_samples (tuple[int, int]): A range to randomly sample negative texts. The first integer specifies the
+                minimum number of negative samples, and the second integer specifies the maximum.
+            max_samples (int): The maximum number of different text samples in one image.
+            padding (bool): Whether to pad texts to max_samples. If True, the number of texts will always be equal to
+                max_samples.
+            padding_value (str): The padding text to use when padding is True.
+        """
+        self.prompt_format = prompt_format
+        self.neg_samples = neg_samples
+        self.max_samples = max_samples
+        self.padding = padding
+        self.padding_value = padding_value
+
+    def __call__(self, labels: dict[str, Any]) -> dict[str, Any]:
+        """Randomly sample positive and negative texts and update class indices accordingly.
+
+        This method samples positive texts based on the existing class labels in the image, and randomly selects
+        negative texts from the remaining classes. It then updates the class indices to match the new sampled text
+        order.
+
+        Args:
+            labels (dict[str, Any]): A dictionary containing image labels and metadata. Must include 'texts' and 'cls'
+                keys.
+
+        Returns:
+            (dict[str, Any]): Updated labels dictionary with new 'cls' and 'texts' entries.
+
+        Examples:
+            >>> loader = RandomLoadText(prompt_format="A photo of {}", neg_samples=(5, 10), max_samples=20)
+            >>> labels = {"cls": np.array([[0], [1], [2]]), "texts": [["dog"], ["cat"], ["bird"]]}
+            >>> updated_labels = loader(labels)
+        """
+        assert "texts" in labels, "No texts found in labels."
+        class_texts = labels["texts"]
+        num_classes = len(class_texts)
+        cls = np.asarray(labels.pop("cls"), dtype=int)
+        pos_labels = np.unique(cls).tolist()
+
+        if len(pos_labels) > self.max_samples:
+            pos_labels = random.sample(pos_labels, k=self.max_samples)
+
+        neg_samples = min(min(num_classes, self.max_samples) - len(pos_labels), random.randint(*self.neg_samples))
+        neg_labels = [i for i in range(num_classes) if i not in pos_labels]
+        neg_labels = random.sample(neg_labels, k=neg_samples)
+
+        sampled_labels = pos_labels + neg_labels
+        # Randomness
+        # random.shuffle(sampled_labels)
+
+        label2ids = {label: i for i, label in enumerate(sampled_labels)}
+        valid_idx = np.zeros(len(labels["instances"]), dtype=bool)
+        new_cls = []
+        for i, label in enumerate(cls.squeeze(-1).tolist()):
+            if label not in label2ids:
+                continue
+            valid_idx[i] = True
+            new_cls.append([label2ids[label]])
+        labels["instances"] = labels["instances"][valid_idx]
+        labels["cls"] = np.array(new_cls)
+
+        # Randomly select one prompt when there's more than one prompts
+        texts = []
+        for label in sampled_labels:
+            prompts = class_texts[label]
+            assert len(prompts) > 0
+            prompt = self.prompt_format.format(prompts[random.randrange(len(prompts))])
+            texts.append(prompt)
+
+        if self.padding:
+            valid_labels = len(pos_labels) + len(neg_labels)
+            num_padding = self.max_samples - valid_labels
+            if num_padding > 0:
+                texts += random.choices(self.padding_value, k=num_padding)
+
+        assert len(texts) == self.max_samples
+        labels["texts"] = texts
+        return labels
+
+
+def v8_transforms(dataset, imgsz: int, hyp: IterableSimpleNamespace, stretch: bool = False):
+    """Apply a series of image transformations for training.
+
+    This function creates a composition of image augmentation techniques to prepare images for YOLO training. It
+    includes operations such as mosaic, copy-paste, random perspective, mixup, and various color adjustments.
+
+    Args:
+        dataset (Dataset): The dataset object containing image data and annotations.
+        imgsz (int): The target image size for resizing.
+        hyp (IterableSimpleNamespace): A dictionary of hyperparameters controlling various aspects of the
+            transformations.
+        stretch (bool): If True, applies stretching to the image. If False, uses LetterBox resizing.
+
+    Returns:
+        (Compose): A composition of image transformations to be applied to the dataset.
+
+    Examples:
+        >>> from ultralytics.data.dataset import YOLODataset
+        >>> from ultralytics.utils import IterableSimpleNamespace
+        >>> dataset = YOLODataset(img_path="path/to/images", imgsz=640)
+        >>> hyp = IterableSimpleNamespace(mosaic=1.0, copy_paste=0.5, degrees=10.0, translate=0.2, scale=0.9)
+        >>> transforms = v8_transforms(dataset, imgsz=640, hyp=hyp)
+        >>> augmented_data = transforms(dataset[0])
+
+        >>> # With custom albumentations
+        >>> import albumentations as A
+        >>> augmentations = [A.Blur(p=0.01), A.CLAHE(p=0.01)]
+        >>> hyp.augmentations = augmentations
+        >>> transforms = v8_transforms(dataset, imgsz=640, hyp=hyp)
+    """
+    mosaic = Mosaic(dataset, imgsz=imgsz, p=hyp.mosaic)
+    affine = RandomPerspective(
+        degrees=hyp.degrees,
+        translate=hyp.translate,
+        scale=hyp.scale,
+        shear=hyp.shear,
+        perspective=hyp.perspective,
+        pre_transform=None if stretch else LetterBox(new_shape=(imgsz, imgsz)),
     )
+
+    pre_transform = Compose([mosaic, affine])
+    if hyp.copy_paste_mode == "flip":
+        pre_transform.insert(1, CopyPaste(p=hyp.copy_paste, mode=hyp.copy_paste_mode))
+    else:
+        pre_transform.append(
+            CopyPaste(
+                dataset,
+                pre_transform=Compose([Mosaic(dataset, imgsz=imgsz, p=hyp.mosaic), affine]),
+                p=hyp.copy_paste,
+                mode=hyp.copy_paste_mode,
+            )
+        )
     flip_idx = dataset.data.get("flip_idx", [])  # for keypoints augmentation
     if dataset.use_keypoints:
         kpt_shape = dataset.data.get("kpt_shape", None)
@@ -1918,42 +2505,40 @@ def v8_transforms(dataset, imgsz, hyp, stretch=False):
         [
             pre_transform,
             MixUp(dataset, pre_transform=pre_transform, p=hyp.mixup),
-            Albumentations(p=1.0),
+            CutMix(dataset, pre_transform=pre_transform, p=hyp.cutmix),
+            Albumentations(p=1.0, transforms=getattr(hyp, "augmentations", None)),
             RandomHSV(hgain=hyp.hsv_h, sgain=hyp.hsv_s, vgain=hyp.hsv_v),
-            RandomFlip(direction="vertical", p=hyp.flipud),
+            RandomFlip(direction="vertical", p=hyp.flipud, flip_idx=flip_idx),
             RandomFlip(direction="horizontal", p=hyp.fliplr, flip_idx=flip_idx),
         ]
-    )   # localization transforms
+    )  # transforms
 
 
-
-
-def v8_transforms_loc(dataset, imgsz, hyp, stretch=False):
-    """Convert images to a size suitable for YOLOv8 training."""
-    pre_transform = Compose(
-        [
-            Mosaic(dataset, imgsz=imgsz, p=hyp.mosaic),
-            LetterBox(new_shape=(imgsz, imgsz))
-            #RandomPerspective(
-            #    degrees=hyp.degrees,
-            #    translate=hyp.translate,
-            #    scale=hyp.scale,
-            #    shear=hyp.shear,
-            #    perspective=hyp.perspective,
-            #    pre_transform=None if stretch else LetterBox(new_shape=(imgsz, imgsz)),
-            #),
-        ]
+def v8_transforms_loc(dataset, imgsz: int, hyp: IterableSimpleNamespace, stretch: bool = False):
+    """Apply a series of image transformations for locate training."""
+    mosaic = Mosaic(dataset, imgsz=imgsz, p=hyp.mosaic)
+    affine = RandomPerspective(
+        degrees=hyp.degrees,
+        translate=hyp.translate,
+        scale=hyp.scale,
+        shear=hyp.shear,
+        perspective=hyp.perspective,
+        pre_transform=None if stretch else LetterBox(new_shape=(imgsz, imgsz)),
     )
+    pre_transform = Compose([mosaic, affine])
 
     return Compose(
         [
             pre_transform,
-            Albumentations(p=1.0, use_locations=True),
+            MixUp(dataset, pre_transform=pre_transform, p=hyp.mixup),
+            Albumentations(p=1.0, transforms=getattr(hyp, "augmentations", None)),
             RandomHSV(hgain=hyp.hsv_h, sgain=hyp.hsv_s, vgain=hyp.hsv_v),
             RandomFlip(direction="vertical", p=hyp.flipud),
-            RandomFlip(direction="horizontal", p=hyp.fliplr, flip_idx=None),
+            RandomFlip(direction="horizontal", p=hyp.fliplr),
         ]
-    )   # localization transforms
+    )
+
+
 # Classification augmentations -----------------------------------------------------------------------------------------
 def classify_transforms(
     size: tuple[int, int] | int = 224,

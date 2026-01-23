@@ -785,7 +785,41 @@ def plot_images(
     save: bool = True,
     conf_thres: float = 0.25,
 ) -> np.ndarray | None:
-    """Plot image grid with labels, bounding boxes, masks, keypoints, or locations."""
+    """Plot image grid with labels, bounding boxes, masks, keypoints, or locations.
+
+    Args:
+        labels (dict[str, Any] | None): Optional dictionary containing detection data with keys like 'cls', 'bboxes',
+            'locations', 'conf', 'masks', 'keypoints', 'batch_idx', 'img'. If provided, it overrides individual args.
+        images (torch.Tensor | np.ndarray): Batch of images to plot. Shape: (batch_size, channels, height, width).
+        batch_idx (torch.Tensor | np.ndarray | None): Batch indices for each label entry.
+        cls (torch.Tensor | np.ndarray | None): Class indices for each label entry.
+        bboxes (torch.Tensor | np.ndarray): Bounding boxes in xywh or xyxy format depending on upstream usage.
+        locations (torch.Tensor | np.ndarray): Localization points, shape (N, 2).
+        confs (torch.Tensor | np.ndarray | None): Confidence scores for detections.
+        masks (torch.Tensor | np.ndarray): Instance masks.
+        kpts (torch.Tensor | np.ndarray): Keypoints, shape (N, K*3) or (N, K, 3).
+        paths (list[str] | None): List of file paths for each image in the batch.
+        fname (str): Output filename for the plotted image grid.
+        names (dict[int, str] | None): Dictionary mapping class indices to class names.
+        on_plot (Callable | None): Optional callback function to be called after saving the plot.
+        max_size (int): Maximum size of the output image grid.
+        max_subplots (int): Maximum number of subplots in the image grid.
+        save (bool): Whether to save the plotted image grid to a file.
+        conf_thres (float): Confidence threshold for displaying detections.
+
+    Returns:
+        (np.ndarray | None): Plotted image grid as a numpy array if save is False, None otherwise.
+
+    Notes:
+        This function supports both tensor and numpy array inputs. It will automatically
+        convert tensor inputs to numpy arrays for processing.
+
+        Channel Support:
+        - 1 channel: Grayscale
+        - 2 channels: Third channel added as zeros
+        - 3 channels: Used as-is (standard RGB)
+        - 4+ channels: Cropped to first 3 channels
+    """
     if labels is not None:
         for k in {"cls", "bboxes", "locations", "conf", "masks", "keypoints", "batch_idx", "img"}:
             if k not in labels:
@@ -1121,16 +1155,6 @@ def plot_tune_results(csv_file: str = "tune_results.csv", exclude_zero_fitness_p
     plt.legend()
     _save_one_file(csv_file.with_name("tune_fitness.png"))
 
-def output_to_target(output, max_det=300):
-    """Convert model output to target format [batch_id, class_id, x, y, w, h, conf] for plotting."""
-    targets = []
-    for i, o in enumerate(output):
-        box, conf, cls = o[:max_det, :6].cpu().split((4, 1, 1), 1)
-        j = torch.full((conf.shape[0], 1), i)
-        targets.append(torch.cat((j, cls, ops.xyxy2xywh(box), conf), 1))
-    targets = torch.cat(targets, 0).numpy()
-    return targets[:, 0], targets[:, 1], targets[:, 2:-1], targets[:, -1]
-
 def output_to_target_loc(output, max_det=300):
     """Convert model output to target format [batch_id, class_id, x, y, conf] for plotting."""
     targets = []
@@ -1138,28 +1162,6 @@ def output_to_target_loc(output, max_det=300):
         loc, conf, cls = o[:max_det, :4].cpu().split((2, 1, 1), 1)
         j = torch.full((conf.shape[0], 1), i)
         targets.append(torch.cat((j, cls, loc, conf), 1))
-    targets = torch.cat(targets, 0).numpy()
-    return targets[:, 0], targets[:, 1], targets[:, 2:-1], targets[:, -1]
-
-
-def output_to_target_loc(output, max_det=300):
-    """Convert model output to target format [batch_id, class_id, x, y, conf] for plotting."""
-    targets = []
-    for i, o in enumerate(output):
-        loc, conf, cls = o[:max_det, :4].cpu().split((2, 1, 1), 1)
-        j = torch.full((conf.shape[0], 1), i)
-        targets.append(torch.cat((j, cls, loc, conf), 1))
-    targets = torch.cat(targets, 0).numpy()
-    return targets[:, 0], targets[:, 1], targets[:, 2:-1], targets[:, -1]
-
-
-def output_to_rotated_target(output, max_det=300):
-    """Convert model output to target format [batch_id, class_id, x, y, w, h, conf] for plotting."""
-    targets = []
-    for i, o in enumerate(output):
-        box, conf, cls, angle = o[:max_det].cpu().split((4, 1, 1, 1), 1)
-        j = torch.full((conf.shape[0], 1), i)
-        targets.append(torch.cat((j, cls, box, angle, conf), 1))
     targets = torch.cat(targets, 0).numpy()
     return targets[:, 0], targets[:, 1], targets[:, 2:-1], targets[:, -1]
 

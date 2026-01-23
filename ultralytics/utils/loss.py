@@ -6,24 +6,29 @@ import math
 from typing import Any
 
 import torch
-import math
 import torch.nn as nn
 import torch.nn.functional as F
 
 from ultralytics.utils.metrics import OKS_SIGMA, RLE_WEIGHT
 from ultralytics.utils.ops import crop_mask, xywh2xyxy, xyxy2xywh
-from ultralytics.utils.tal import (
-    LocTaskAlignedAssigner,
-    RotatedTaskAlignedAssigner,
-    TaskAlignedAssigner,
-    dist2bbox,
-    dist2rbox,
-    make_anchors,
-)
+from ultralytics.utils import tal as tal_utils
+from ultralytics.utils.tal import dist2bbox, dist2rbox, make_anchors
 from ultralytics.utils.torch_utils import autocast
 
 from .metrics import bbox_iou, probiou
 from .tal import bbox2dist, rbox2dist
+
+# Assigner classes (keep module import order resilient to circular imports)
+TaskAlignedAssigner = tal_utils.TaskAlignedAssigner
+RotatedTaskAlignedAssigner = tal_utils.RotatedTaskAlignedAssigner
+LocTaskAlignedAssigner = getattr(tal_utils, "LocTaskAlignedAssigner", None)
+
+if LocTaskAlignedAssigner is None:
+    class LocTaskAlignedAssigner(TaskAlignedAssigner):  # type: ignore[misc]
+        """Fallback assigner to keep imports working when locate assigner is unavailable."""
+
+        def __init__(self, *args, **kwargs):
+            raise ImportError("LocTaskAlignedAssigner is not available in ultralytics.utils.tal")
 
 
 class VarifocalLoss(nn.Module):
@@ -428,7 +433,9 @@ class v8DetectionLoss:
         return dist2bbox(pred_dist, anchor_points, xywh=False)
 
     def get_assigned_targets_and_loss(self, preds: dict[str, torch.Tensor], batch: dict[str, Any]) -> tuple:
-        """Calculate detection loss along with assignment outputs for downstream tasks."""
+        """Calculate the sum of the loss for box, cls and dfl multiplied by batch size and return foreground mask and
+        target indices.
+        """
         loss = torch.zeros(3, device=self.device)  # box, cls, dfl
         pred_distri, pred_scores = (
             preds["boxes"].permute(0, 2, 1).contiguous(),
@@ -441,87 +448,14 @@ class v8DetectionLoss:
         imgsz = torch.tensor(preds["feats"][0].shape[2:], device=self.device, dtype=dtype) * self.stride[0]
 
         # Targets
-        targets = torch.cat((batch["batch_idx"].view(-1, 1), batch["cls"].view(-1, 1), batch["bboxes"]), 1) #normalized coords 
+        targets = torch.cat((batch["batch_idx"].view(-1, 1), batch["cls"].view(-1, 1), batch["bboxes"]), 1)
         targets = self.preprocess(targets.to(self.device), batch_size, scale_tensor=imgsz[[1, 0, 1, 0]])
         gt_labels, gt_bboxes = targets.split((1, 4), 2)  # cls, xyxy
-        mask_gt = gt_bboxes.sum(2, keepdim=True).gt_(0)
+        mask_gt = gt_bboxes.sum(2, keepdim=True).gt_(0.0)
 
         # Pboxes
         pred_bboxes = self.bbox_decode(anchor_points, pred_distri)  # xyxy, (b, h*w, 4)
 
-        _, target_bboxes, target_scores, fg_mask, _ = self.assigner(
-            pred_scores.detach().sigmoid(),
-            (pred_bboxes.detach() * stride_tensor).type(gt_bboxes.dtype),
-            anchor_points * stride_tensor,
-            gt_labels,
-            gt_bboxes,
-            mask_gt,
-        )
-
-        target_scores_sum = max(target_scores.sum(), 1)
-
-        # Cls loss
-        # loss[1] = self.varifocal_loss(pred_scores, target_scores, target_labels) / target_scores_sum  # VFL way
-        loss[1] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum  # BCE
-
-        # Bbox loss
-        if fg_mask.sum():
-            target_bboxes /= stride_tensor
-            loss[0], loss[2] = self.bbox_loss(
-                pred_distri, pred_bboxes, anchor_points, target_bboxes, target_scores, target_scores_sum, fg_mask
-            )
-
-        loss[0] *= self.hyp.box  # box gain
-        loss[1] *= self.hyp.cls  # cls gain
-        loss[2] *= self.hyp.dfl  # dfl gain
-
-        return loss.sum() * batch_size, loss.detach()  # loss(box, cls, dfl)
-
-
-class v8SegmentationLoss(v8DetectionLoss):
-    """Criterion class for computing training losses."""
-
-    def __init__(self, model):  # model must be de-paralleled
-        """Initializes the v8SegmentationLoss class, taking a de-paralleled model as argument."""
-        super().__init__(model)
-        self.overlap = model.args.overlap_mask
-
-    def __call__(self, preds, batch):
-        """Calculate and return the loss for the YOLO model."""
-        loss = torch.zeros(4, device=self.device)  # box, cls, dfl
-        feats, pred_masks, proto = preds if len(preds) == 3 else preds[1]
-        batch_size, _, mask_h, mask_w = proto.shape  # batch size, number of masks, mask height, mask width
-        pred_distri, pred_scores = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2).split(
-            (self.reg_max * 4, self.nc), 1
-        )
-
-        # B, grids, ..
-        pred_scores = pred_scores.permute(0, 2, 1).contiguous()
-        pred_distri = pred_distri.permute(0, 2, 1).contiguous()
-        pred_masks = pred_masks.permute(0, 2, 1).contiguous()
-
-        dtype = pred_scores.dtype
-        imgsz = torch.tensor(feats[0].shape[2:], device=self.device, dtype=dtype) * self.stride[0]  # image size (h,w)
-        anchor_points, stride_tensor = make_anchors(feats, self.stride, 0.5)
-
-        # Targets
-        try:
-            batch_idx = batch["batch_idx"].view(-1, 1)
-            targets = torch.cat((batch_idx, batch["cls"].view(-1, 1), batch["bboxes"]), 1)
-            targets = self.preprocess(targets.to(self.device), batch_size, scale_tensor=imgsz[[1, 0, 1, 0]])
-            gt_labels, gt_bboxes = targets.split((1, 4), 2)  # cls, xyxy
-            mask_gt = gt_bboxes.sum(2, keepdim=True).gt_(0)
-        except RuntimeError as e:
-            raise TypeError(
-                "ERROR ❌ segment dataset incorrectly formatted or not a segment dataset.\n"
-                "This error can occur when incorrectly training a 'segment' model on a 'detect' dataset, "
-                "i.e. 'yolo train model=yolov8n-seg.pt data=coco8.yaml'.\nVerify your dataset is a "
-                "correctly formatted 'segment' dataset using 'data=coco8-seg.yaml' "
-                "as an example.\nSee https://docs.ultralytics.com/datasets/segment/ for help."
-            ) from e
-
-        # Pboxes
-        pred_bboxes = self.bbox_decode(anchor_points, pred_distri)  # xyxy, (b, h*w, 4)
         _, target_bboxes, target_scores, fg_mask, target_gt_idx = self.assigner(
             pred_scores.detach().sigmoid(),
             (pred_bboxes.detach() * stride_tensor).type(gt_bboxes.dtype),
@@ -534,18 +468,15 @@ class v8SegmentationLoss(v8DetectionLoss):
         target_scores_sum = max(target_scores.sum(), 1)
 
         # Cls loss
-        # loss[1] = self.varifocal_loss(pred_scores, target_scores, target_labels) / target_scores_sum  # VFL way
         loss[1] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum  # BCE
 
         # Bbox loss
-        target_bboxes_raw = target_bboxes
         if fg_mask.sum():
-            target_bboxes_scaled = target_bboxes_raw / stride_tensor
             loss[0], loss[2] = self.bbox_loss(
                 pred_distri,
                 pred_bboxes,
                 anchor_points,
-                target_bboxes_scaled,
+                target_bboxes / stride_tensor,
                 target_scores,
                 target_scores_sum,
                 fg_mask,
@@ -556,30 +487,31 @@ class v8SegmentationLoss(v8DetectionLoss):
         loss[0] *= self.hyp.box  # box gain
         loss[1] *= self.hyp.cls  # cls gain
         loss[2] *= self.hyp.dfl  # dfl gain
+        return (
+            (fg_mask, target_gt_idx, target_bboxes, anchor_points, stride_tensor),
+            loss,
+            loss.detach(),
+        )  # loss(box, cls, dfl)
 
-        return (fg_mask, target_gt_idx, target_bboxes_raw, anchor_points, stride_tensor), loss, pred_bboxes
+    def parse_output(
+        self, preds: dict[str, torch.Tensor] | tuple[torch.Tensor, dict[str, torch.Tensor]]
+    ) -> torch.Tensor:
+        """Parse model predictions to extract features."""
+        return preds[1] if isinstance(preds, tuple) else preds
 
-    def __call__(self, preds: Any, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
-        """Compute detection loss for a batch."""
-        preds = preds[1] if isinstance(preds, tuple) else preds
-        if isinstance(preds, dict) and "one2many" in preds:
-            preds = preds["one2many"]
-        _, det_loss, _ = self.get_assigned_targets_and_loss(preds, batch)
-        batch_size = preds["scores"].shape[0]
-        return det_loss * batch_size, det_loss.detach()
+    def __call__(
+        self,
+        preds: dict[str, torch.Tensor] | tuple[torch.Tensor, dict[str, torch.Tensor]],
+        batch: dict[str, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Calculate the sum of the loss for box, cls and dfl multiplied by batch size."""
+        return self.loss(self.parse_output(preds), batch)
 
-class MSELoss(nn.Module):
-    """Mean squared error loss with a foreground mask."""
-
-    def __init__(self):
-        super().__init__()
-
-    def forward(self, pred_locations, target_locations, fg_mask):
-        """Compute masked MSE loss for location regression."""
-        diff = (pred_locations - target_locations) ** 2
-        diff = diff.sum(dim=-1)
-        fg_mask = fg_mask.float()
-        return (diff * fg_mask).sum() / max(fg_mask.sum(), 1.0)
+    def loss(self, preds: dict[str, torch.Tensor], batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+        """A wrapper for get_assigned_targets_and_loss and parse_output."""
+        batch_size = preds["boxes"].shape[0]
+        loss, loss_detach = self.get_assigned_targets_and_loss(preds, batch)[1:]
+        return loss * batch_size, loss_detach
 
 
 class v8LocalizationLoss:

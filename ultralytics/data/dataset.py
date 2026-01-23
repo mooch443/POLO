@@ -131,18 +131,18 @@ class YOLODataset(BaseDataset):
                 nc += nc_f
                 if im_file:
                     x["labels"].append(
-                        dict(
-                            im_file=im_file,
-                            shape=shape,
-                            cls=lb[:, 0:1],  # n, 1
-                            bboxes=lb[:, 1:] if not self.use_locations else None,  # n, 4
-                            radii=lb[:, 1:2] if self.use_locations else None,
-                            locations=lb[:, 2:] if self.use_locations else None,  # n, 2
-                            segments=segments,
-                            keypoints=keypoint,
-                            normalized=True,
-                            bbox_format="xywh",
-                        )
+                        {
+                            "im_file": im_file,
+                            "shape": shape,
+                            "cls": lb[:, 0:1],  # n, 1
+                            "bboxes": lb[:, 1:] if not self.use_locations else None,  # n, 4
+                            "radii": lb[:, 1:2] if self.use_locations else None,
+                            "locations": lb[:, 2:] if self.use_locations else None,  # n, 2
+                            "segments": segments,
+                            "keypoints": keypoint,
+                            "normalized": True,
+                            "bbox_format": "xywh",
+                        }
                     )
                 if msg:
                     msgs.append(msg)
@@ -238,7 +238,6 @@ class YOLODataset(BaseDataset):
                 return_mask=self.use_segments,
                 return_keypoint=self.use_keypoints,
                 return_obb=self.use_obb,
-                return_locations=self.use_locations,
                 batch_idx=True,
                 mask_ratio=hyp.mask_ratio,
                 mask_overlap=hyp.overlap_mask,
@@ -312,6 +311,8 @@ class YOLODataset(BaseDataset):
         for i, k in enumerate(keys):
             value = values[i]
             if k in {"img", "text_feats", "sem_masks"}:
+                if isinstance(value[0], np.ndarray):
+                    value = [torch.from_numpy(v) for v in value]
                 value = torch.stack(value, 0)
             elif k == "visuals":
                 value = torch.nn.utils.rnn.pad_sequence(value, batch_first=True)

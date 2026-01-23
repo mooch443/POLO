@@ -240,6 +240,7 @@ CFG_BOOL_KEYS = frozenset(
         "simplify",
         "nms",
         "profile",
+        "end2end",
     }
 )
 

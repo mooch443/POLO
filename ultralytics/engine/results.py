@@ -772,9 +772,6 @@ class Results(SimpleClass, DataExportMixin):
         if self.locations is not None:
             LOGGER.warning("Localization task does not support `save_crop`.")
             return
-        if self.locations is not None:
-            LOGGER.warning("WARNING ⚠️ OBB task do not support `save_crop`.")
-            return
         for d in self.boxes:
             save_one_box(
                 d.xyxy,
