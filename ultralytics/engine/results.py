@@ -856,11 +856,16 @@ class Results(SimpleClass, DataExportMixin):
         if self.locations is not None:
             for row in self.locations:
                 class_id, conf = int(row.cls), round(row.conf.item(), decimals)
-                loc = row.xy.squeeze()
+                loc = row.xyn.squeeze()
                 if isinstance(loc, torch.Tensor):
                     loc = loc.tolist()
-                location = {"x": round(loc[0] / w, decimals), "y": round(loc[1] / h, decimals)}
-                result = {"name": self.names[class_id], "class": class_id, "confidence": conf, "location": location}
+                location = {"x": round(loc[0], decimals), "y": round(loc[1], decimals)}
+                result = {
+                    "name": self.names[class_id],
+                    "class": class_id,
+                    "confidence": conf,
+                    "location": location,
+                }
                 if row.id is not None:
                     result["track_id"] = int(row.id.item())
                 results.append(result)

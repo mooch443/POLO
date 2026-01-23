@@ -4,4 +4,8 @@ from .train import LocalizationTrainer
 from .val import LocalizationValidator
 from .predict import LocalizationPredictor
 
-__all__ = "Localizationtrainer", "Localizationvalidator", "LocalizationPredictor"
+__all__ = (
+    "LocalizationTrainer",
+    "LocalizationValidator",
+    "LocalizationPredictor",
+)

@@ -516,33 +516,51 @@ class Instances:
         if len(instances_list) == 1:
             return instances_list[0]
 
-        use_locations = instances_list[0].locations is not None
-        use_keypoint = instances_list[0].keypoints is not None
-        bbox_format = instances_list[0]._bboxes.format if instances_list[0]._bboxes is not None else "xywh"
+        use_boxes = any(ins._bboxes is not None for ins in instances_list)
+        use_locations = any(ins.locations is not None for ins in instances_list)
+        use_keypoint = any(ins.keypoints is not None for ins in instances_list)
+        bbox_format = next(
+            (ins._bboxes.format for ins in instances_list if ins._bboxes is not None),
+            "xywh",
+        )
         normalized = instances_list[0].normalized
 
-        cat_boxes = np.concatenate([ins.bboxes for ins in instances_list], axis=axis) if not use_locations else None
-        cat_locations = (
-            np.concatenate([ins.locations for ins in instances_list], axis=axis) if use_locations else None
+        cat_boxes = (
+            np.concatenate([ins.bboxes for ins in instances_list if ins._bboxes is not None], axis=axis)
+            if use_boxes
+            else None
         )
-        if not use_locations:
-            seg_len = [b.segments.shape[1] for b in instances_list]
-            if len(frozenset(seg_len)) > 1:  # resample segments if there's different length
+        cat_locations = (
+            np.concatenate([ins.locations for ins in instances_list if ins.locations is not None], axis=axis)
+            if use_locations
+            else None
+        )
+
+        segments_list = [ins.segments for ins in instances_list if ins.segments is not None]
+        if segments_list:
+            seg_len = [seg.shape[1] for seg in segments_list]
+            if len({*seg_len}) > 1:
                 max_len = max(seg_len)
-                cat_segments = np.concatenate(
-                    [
-                        resample_segments(list(b.segments), max_len)
-                        if len(b.segments)
-                        else np.zeros((0, max_len, 2), dtype=np.float32)  # re-generating empty segments
-                        for b in instances_list
-                    ],
-                    axis=axis,
-                )
+                reordered = []
+                for ins in instances_list:
+                    seg = ins.segments
+                    if seg is None or not len(seg):
+                        reordered.append(np.zeros((0, max_len, 2), dtype=np.float32))
+                    elif seg.shape[1] != max_len:
+                        reordered.append(resample_segments(list(seg), max_len))
+                    else:
+                        reordered.append(seg)
+                cat_segments = np.concatenate(reordered, axis=axis)
             else:
-                cat_segments = np.concatenate([b.segments for b in instances_list], axis=axis)
+                cat_segments = np.concatenate(segments_list, axis=axis)
         else:
-            cat_segments = np.concatenate([b.segments for b in instances_list], axis=axis) if instances_list[0].segments is not None else None
-        cat_keypoints = np.concatenate([b.keypoints for b in instances_list], axis=axis) if use_keypoint else None
+            cat_segments = None
+
+        cat_keypoints = (
+            np.concatenate([ins.keypoints for ins in instances_list if ins.keypoints is not None], axis=axis)
+            if use_keypoint
+            else None
+        )
         return cls(cat_boxes, cat_locations, cat_segments, cat_keypoints, bbox_format, normalized)
 
     @property

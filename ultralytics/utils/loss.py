@@ -523,7 +523,8 @@ class v8LocalizationLoss:
         h = model.args
         m = model.model[-1]  # Locate() module
         self.bce = nn.BCEWithLogitsLoss(reduction="none")
-        self.loc_loss = MSELoss()
+        self.loc_loss_type = getattr(h, "loc_loss", "mse")
+        self.loc_loss = self._build_loc_loss(self.loc_loss_type)
         self.radii = model.radii
         self.hyp = h
         self.stride = m.stride
@@ -605,9 +606,21 @@ class v8LocalizationLoss:
 
         loss[0] *= self.hyp.loc
         loss[1] *= self.hyp.cls
-        assert not math.isnan(loss[0]) and not math.isnan(loss[1]), "Loss is nan!"
+        if torch.isnan(loss).any():
+            raise RuntimeError(
+                "Localization loss produced NaNs—check your data/hyperparameters or debug the assigner output."
+            )
 
         return loss.sum() * batch_size, loss.detach()
+
+    def _build_loc_loss(self, loss_type: str) -> nn.Module:
+        """Return the requested localization loss module."""
+        loss_type = (loss_type or "mse").lower()
+        if loss_type in {"hausdorff", "hd"}:
+            return HausdorffLoss()
+        if loss_type in {"mse", "l2"}:
+            return MSELoss()
+        raise ValueError(f"Unsupported localization loss '{loss_type}'")
 
 class v8SegmentationLoss(v8DetectionLoss):
     """Criterion class for computing training losses for YOLOv8 segmentation."""
