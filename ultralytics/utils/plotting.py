@@ -934,12 +934,13 @@ def plot_images(
                             locs[:, 1] *= h
                         elif scale < 1:  # absolute coords need scale if image scales
                             locs[:, :2] *= scale
-                    if rads is not None and len(rads):
+                    if rads is not None:
                         rads = np.squeeze(rads)
-                        if np.max(rads) <= 1.1:
-                            rads = rads * max(w, h)
-                        elif scale < 1:
-                            rads = rads * scale
+                        if np.size(rads):
+                            if np.max(rads) <= 1.1:
+                                rads = rads * max(w, h)
+                            elif scale < 1:
+                                rads = rads * scale
                     locs[:, 0] += x
                     locs[:, 1] += y
                     for j, loc in enumerate(locs.astype(np.int64).tolist()):
@@ -949,8 +950,9 @@ def plot_images(
                         if labels or conf[j] > conf_thres:
                             label = f"{c}" if labels else f"{c} {conf[j]:.2f}"
                             loc_radius = 4
-                            if rads is not None and len(rads):
-                                loc_radius = max(1, int(round(float(rads[j]))))
+                            if rads is not None and np.size(rads):
+                                rads_j = float(rads) if np.ndim(rads) == 0 else float(rads[j])
+                                loc_radius = max(1, int(round(rads_j)))
                             annotator.loc_label(loc, label, color=color, loc_radius=loc_radius)
 
             elif len(locations):
@@ -963,12 +965,13 @@ def plot_images(
                         locs[:, 1] *= h
                     elif scale < 1:  # absolute coords need scale if image scales
                         locs[:, :2] *= scale
-                if rads is not None and len(rads):
+                if rads is not None:
                     rads = np.squeeze(rads)
-                    if np.max(rads) <= 1.1:
-                        rads = rads * max(w, h)
-                    elif scale < 1:
-                        rads = rads * scale
+                    if np.size(rads):
+                        if np.max(rads) <= 1.1:
+                            rads = rads * max(w, h)
+                        elif scale < 1:
+                            rads = rads * scale
                 locs[:, 0] += x
                 locs[:, 1] += y
                 for j, loc in enumerate(locs.astype(np.int64).tolist()):
@@ -978,8 +981,9 @@ def plot_images(
                     if labels or conf[j] > conf_thres:
                         label = f"{c}" if labels else f"{c} {conf[j]:.2f}"
                         loc_radius = 4
-                        if rads is not None and len(rads):
-                            loc_radius = max(1, int(round(float(rads[j]))))
+                        if rads is not None and np.size(rads):
+                            rads_j = float(rads) if np.ndim(rads) == 0 else float(rads[j])
+                            loc_radius = max(1, int(round(rads_j)))
                         annotator.loc_label(loc, label, color=color, loc_radius=loc_radius)
 
             elif len(classes):
