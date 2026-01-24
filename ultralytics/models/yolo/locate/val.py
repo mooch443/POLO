@@ -202,9 +202,7 @@ class LocalizationValidator(BaseValidator):
 
         if self.args.plots:
             for normalize in True, False:
-                self.confusion_matrix.plot(
-                    save_dir=self.save_dir, names=self.names.values(), normalize=normalize, on_plot=self.on_plot
-                )
+                self.confusion_matrix.plot(save_dir=self.save_dir, normalize=normalize, on_plot=self.on_plot)
 
     def _process_batch(self, detections, gt_locations, gt_cls):
         """Return correct prediction matrix."""
