@@ -137,6 +137,7 @@ class LocalizationTrainer(BaseTrainer):
             batch_idx=batch["batch_idx"],
             cls=batch["cls"].squeeze(-1),
             locations=batch["locations"],
+            radii=batch["radii"],
             paths=batch["im_file"],
             fname=self.save_dir / f"train_batch{ni}.jpg",
             on_plot=self.on_plot,

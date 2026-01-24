@@ -773,6 +773,7 @@ def plot_images(
     cls: torch.Tensor | np.ndarray | None = None,
     bboxes: torch.Tensor | np.ndarray = np.zeros(0, dtype=np.float32),
     locations: torch.Tensor | np.ndarray = np.zeros((0, 2), dtype=np.float32),
+    radii: torch.Tensor | np.ndarray = np.zeros((0, 1), dtype=np.float32),
     confs: torch.Tensor | np.ndarray | None = None,
     masks: torch.Tensor | np.ndarray = np.zeros(0, dtype=np.uint8),
     kpts: torch.Tensor | np.ndarray = np.zeros((0, 51), dtype=np.float32),
@@ -821,7 +822,7 @@ def plot_images(
         - 4+ channels: Cropped to first 3 channels
     """
     if labels is not None:
-        for k in {"cls", "bboxes", "locations", "conf", "masks", "keypoints", "batch_idx", "img"}:
+        for k in {"cls", "bboxes", "locations", "radii", "conf", "masks", "keypoints", "batch_idx", "img"}:
             if k not in labels:
                 continue
             if k == "cls" and isinstance(labels[k], torch.Tensor) and labels[k].ndim == 2:
@@ -833,6 +834,7 @@ def plot_images(
         batch_idx = labels.get("batch_idx", np.zeros(cls.shape, dtype=np.int64))
         bboxes = labels.get("bboxes", np.zeros(0, dtype=np.float32))
         locations = labels.get("locations", np.zeros((0, 2), dtype=np.float32))
+        radii = labels.get("radii", np.zeros((0, 1), dtype=np.float32))
         confs = labels.get("conf", None)
         masks = labels.get("masks", np.zeros(0, dtype=np.uint8))
         kpts = labels.get("keypoints", np.zeros(0, dtype=np.float32))
@@ -852,6 +854,8 @@ def plot_images(
         bboxes = bboxes.cpu().numpy()
     if isinstance(locations, torch.Tensor):
         locations = locations.cpu().numpy()
+    if isinstance(radii, torch.Tensor):
+        radii = radii.cpu().numpy()
     if isinstance(masks, torch.Tensor):
         masks = masks.cpu().numpy().astype(int)
     if isinstance(kpts, torch.Tensor):
@@ -923,12 +927,19 @@ def plot_images(
                 elif len(locations):
                     locs = locations[idx]
                     conf = confs[idx] if confs is not None else None  # check for confidence presence (label vs pred)
+                    rads = radii[idx] if len(radii) else None
                     if len(locs):
                         if locs[:, :2].max() <= 1.1:  # if normalized with tolerance 0.1
                             locs[:, 0] *= w  # scale to pixels
                             locs[:, 1] *= h
                         elif scale < 1:  # absolute coords need scale if image scales
                             locs[:, :2] *= scale
+                    if rads is not None and len(rads):
+                        rads = np.squeeze(rads)
+                        if np.max(rads) <= 1.1:
+                            rads = rads * max(w, h)
+                        elif scale < 1:
+                            rads = rads * scale
                     locs[:, 0] += x
                     locs[:, 1] += y
                     for j, loc in enumerate(locs.astype(np.int64).tolist()):
@@ -937,17 +948,27 @@ def plot_images(
                         c = names.get(c, c) if names else c
                         if labels or conf[j] > conf_thres:
                             label = f"{c}" if labels else f"{c} {conf[j]:.2f}"
-                            annotator.loc_label(loc, label, color=color)
+                            loc_radius = 4
+                            if rads is not None and len(rads):
+                                loc_radius = max(1, int(round(float(rads[j]))))
+                            annotator.loc_label(loc, label, color=color, loc_radius=loc_radius)
 
             elif len(locations):
                 locs = locations[idx]
                 conf = confs[idx] if confs is not None else None  # check for confidence presence (label vs pred)
+                rads = radii[idx] if len(radii) else None
                 if len(locs):
                     if locs[:, :2].max() <= 1.1:  # if normalized with tolerance 0.1
                         locs[:, 0] *= w  # scale to pixels
                         locs[:, 1] *= h
                     elif scale < 1:  # absolute coords need scale if image scales
                         locs[:, :2] *= scale
+                if rads is not None and len(rads):
+                    rads = np.squeeze(rads)
+                    if np.max(rads) <= 1.1:
+                        rads = rads * max(w, h)
+                    elif scale < 1:
+                        rads = rads * scale
                 locs[:, 0] += x
                 locs[:, 1] += y
                 for j, loc in enumerate(locs.astype(np.int64).tolist()):
@@ -956,7 +977,10 @@ def plot_images(
                     c = names.get(c, c) if names else c
                     if labels or conf[j] > conf_thres:
                         label = f"{c}" if labels else f"{c} {conf[j]:.2f}"
-                        annotator.loc_label(loc, label, color=color)
+                        loc_radius = 4
+                        if rads is not None and len(rads):
+                            loc_radius = max(1, int(round(float(rads[j]))))
+                        annotator.loc_label(loc, label, color=color, loc_radius=loc_radius)
 
             elif len(classes):
                 for c in classes:
