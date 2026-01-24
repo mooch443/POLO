@@ -571,6 +571,12 @@ class Results(SimpleClass, DataExportMixin):
                 name = ("" if id is None else f"id:{id} ") + names[c]
                 label = (f"{name} {conf:.2f}" if conf else name) if labels else None
                 loc = l.xy
+                if isinstance(loc, torch.Tensor):
+                    loc = loc.squeeze()
+                elif isinstance(loc, np.ndarray):
+                    loc = np.squeeze(loc)
+                if hasattr(loc, "ndim") and loc.ndim > 1:
+                    loc = loc[0]
                 annotator.loc_label(loc, label, color=colors(c, True), loc_radius=loc_radius)
         # Plot Classify results
         if pred_probs is not None and show_probs:

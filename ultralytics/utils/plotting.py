@@ -918,8 +918,26 @@ def plot_images(
                         color = colors(c)
                         c = names.get(c, c) if names else c
                         if labels or conf[j] > conf_thres:
-                            label = f"{c}" if labels else f"{c} {conf[j]:.1f}"
+                            label = f"{c}" if labels else f"{c} {conf[j]:.2f}"
                             annotator.box_label(box, label, color=color)
+                elif len(locations):
+                    locs = locations[idx]
+                    conf = confs[idx] if confs is not None else None  # check for confidence presence (label vs pred)
+                    if len(locs):
+                        if locs[:, :2].max() <= 1.1:  # if normalized with tolerance 0.1
+                            locs[:, 0] *= w  # scale to pixels
+                            locs[:, 1] *= h
+                        elif scale < 1:  # absolute coords need scale if image scales
+                            locs[:, :2] *= scale
+                    locs[:, 0] += x
+                    locs[:, 1] += y
+                    for j, loc in enumerate(locs.astype(np.int64).tolist()):
+                        c = classes[j]
+                        color = colors(c)
+                        c = names.get(c, c) if names else c
+                        if labels or conf[j] > conf_thres:
+                            label = f"{c}" if labels else f"{c} {conf[j]:.2f}"
+                            annotator.loc_label(loc, label, color=color)
 
             elif len(locations):
                 locs = locations[idx]
@@ -937,7 +955,7 @@ def plot_images(
                     color = colors(c)
                     c = names.get(c, c) if names else c
                     if labels or conf[j] > conf_thres:
-                        label = f"{c}" if labels else f"{c} {conf[j]:.1f}"
+                        label = f"{c}" if labels else f"{c} {conf[j]:.2f}"
                         annotator.loc_label(loc, label, color=color)
 
             elif len(classes):

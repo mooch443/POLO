@@ -2,7 +2,7 @@
 
 from ultralytics.engine.predictor import BasePredictor
 from ultralytics.engine.results import Results
-from ultralytics.utils import DEFAULT_CFG, ops
+from ultralytics.utils import DEFAULT_CFG, LOGGER, ops
 from ultralytics.data.utils import check_det_dataset
 
 
@@ -29,8 +29,15 @@ class LocalizationPredictor(BasePredictor):
 
         if radii is None:
             if self.data:
-                data = check_det_dataset(dataset=self.data)
-                radii = data["radii"]
+                try:
+                    data = check_det_dataset(dataset=self.data)
+                    radii = data["radii"]
+                except FileNotFoundError as exc:
+                    LOGGER.warning(
+                        "WARNING ⚠️ dataset config not found for locate predictor; falling back to model radii. "
+                        f"({exc})"
+                    )
+                    radii = getattr(self.model, "radii", None) or {}
             else:
                 radii = getattr(self.model, "radii", None) or {}
 
