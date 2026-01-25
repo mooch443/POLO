@@ -577,7 +577,7 @@ class v8LocalizationLoss:
                 )
                 self._nan_warned = True
                 if not self._nan_dumped:
-                    self._dump_nan_debug(batch, pred_scores, pred_offsets, stage="preds")
+                    self._dump_nan_debug(batch, pred_scores, pred_offsets, stage="preds", feats=feats)
 
         pred_scores = torch.nan_to_num(pred_scores, nan=0.0, posinf=0.0, neginf=0.0)
         pred_offsets = torch.nan_to_num(pred_offsets, nan=0.0, posinf=0.0, neginf=0.0)
@@ -652,7 +652,14 @@ class v8LocalizationLoss:
 
         return loss.sum() * batch_size, loss.detach()
 
-    def _dump_nan_debug(self, batch: dict[str, torch.Tensor], a: torch.Tensor, b: torch.Tensor, stage: str) -> None:
+    def _dump_nan_debug(
+        self,
+        batch: dict[str, torch.Tensor],
+        a: torch.Tensor,
+        b: torch.Tensor,
+        stage: str,
+        feats: list[torch.Tensor] | None = None,
+    ) -> None:
         """Dump a one-time debug snapshot when non-finite values appear."""
         try:
             save_dir = getattr(self.hyp, "save_dir", None)
@@ -671,9 +678,23 @@ class v8LocalizationLoss:
                 "b_shape": list(b.shape),
                 "a_nonfinite": int((~torch.isfinite(a)).sum().item()),
                 "b_nonfinite": int((~torch.isfinite(b)).sum().item()),
+                "autocast": bool(torch.is_autocast_enabled()),
                 "batch_idx": batch_idx_list,
                 "im_files": [str(x) for x in im_files] if isinstance(im_files, (list, tuple)) else [],
             }
+            if feats is not None:
+                feat_stats = []
+                for i, f in enumerate(feats):
+                    feat_stats.append(
+                        {
+                            "i": i,
+                            "shape": list(f.shape),
+                            "nonfinite": int((~torch.isfinite(f)).sum().item()),
+                            "min": float(f.min().item()) if f.numel() else None,
+                            "max": float(f.max().item()) if f.numel() else None,
+                        }
+                    )
+                data["feats"] = feat_stats
             out.write_text(json.dumps(data, indent=2))
             self._nan_dumped = True
             LOGGER.warning(f"WARNING ⚠️ wrote NaN debug snapshot to {out}")
