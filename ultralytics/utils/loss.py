@@ -536,6 +536,7 @@ class v8LocalizationLoss:
 
         self.assigner = LocTaskAlignedAssigner(topk=10, num_classes=self.nc, alpha=0.5, beta=6.0)
         self.proj = torch.arange(m.reg_max, dtype=torch.float, device=device)
+        self._nan_warned = False
 
     def preprocess(self, targets, batch_size, scale_tensor):
         """Preprocess targets to per-image tensors."""
@@ -563,6 +564,16 @@ class v8LocalizationLoss:
 
         pred_scores = pred_scores.permute(0, 2, 1).contiguous()
         pred_offsets = pred_offsets.permute(0, 2, 1).contiguous()
+        if not self._nan_warned:
+            bad_pred_scores = ~torch.isfinite(pred_scores)
+            bad_pred_offsets = ~torch.isfinite(pred_offsets)
+            if bad_pred_scores.any() or bad_pred_offsets.any():
+                LOGGER.warning(
+                    "WARNING ⚠️ non-finite preds detected in locate loss. "
+                    f"scores_bad={int(bad_pred_scores.sum())}, offsets_bad={int(bad_pred_offsets.sum())}"
+                )
+                self._nan_warned = True
+
         pred_scores = torch.nan_to_num(pred_scores, nan=0.0, posinf=0.0, neginf=0.0)
         pred_offsets = torch.nan_to_num(pred_offsets, nan=0.0, posinf=0.0, neginf=0.0)
 
@@ -582,6 +593,16 @@ class v8LocalizationLoss:
         )
         targets = self.preprocess(targets.to(self.device), batch_size, scale_tensor=imgsz[[1, 0]])
         gt_labels, gt_radii, gt_locations = targets.split((1, 1, 2), 2)
+        if not self._nan_warned:
+            bad_gt_locations = ~torch.isfinite(gt_locations)
+            bad_gt_radii = ~torch.isfinite(gt_radii)
+            if bad_gt_locations.any() or bad_gt_radii.any():
+                LOGGER.warning(
+                    "WARNING ⚠️ non-finite targets detected in locate loss. "
+                    f"loc_bad={int(bad_gt_locations.sum())}, radii_bad={int(bad_gt_radii.sum())}"
+                )
+                self._nan_warned = True
+
         gt_locations = torch.nan_to_num(gt_locations, nan=0.0, posinf=0.0, neginf=0.0)
         gt_radii = torch.nan_to_num(gt_radii, nan=0.0, posinf=0.0, neginf=0.0)
         gt_radii = gt_radii.clamp_min(1e-6)
