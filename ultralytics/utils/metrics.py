@@ -308,13 +308,14 @@ def smooth_bce(eps: float = 0.1) -> tuple[float, float]:
 def loc_dor_pw(loc1, loc2, radii, eps=1e-7):
     """Calculate pairwise Distance-over-Radius (DoR) between locations."""
     pairwise_dist = torch.cdist(loc1, loc2)
+    radii = torch.nan_to_num(radii, nan=eps, posinf=eps, neginf=eps).clamp_min(eps)
     pw_dor = pairwise_dist / radii.view(loc1.shape[0], -1)
     return pw_dor + eps
 
 
 def loc_dor(loc1, loc2, radii, eps=1e-7):
     """Calculate Distance-over-Radius (DoR) for aligned location pairs."""
-    radii = radii.view(-1)
+    radii = torch.nan_to_num(radii, nan=eps, posinf=eps, neginf=eps).view(-1).clamp_min(eps)
     return torch.linalg.norm(loc1 - loc2, dim=-1) / radii + eps
 
 

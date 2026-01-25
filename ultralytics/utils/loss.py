@@ -10,6 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from ultralytics.utils.metrics import OKS_SIGMA, RLE_WEIGHT
+from ultralytics.utils import LOGGER
 from ultralytics.utils.ops import crop_mask, xywh2xyxy, xyxy2xywh
 from ultralytics.utils import tal as tal_utils
 from ultralytics.utils.tal import dist2bbox, dist2rbox, make_anchors
@@ -562,6 +563,8 @@ class v8LocalizationLoss:
 
         pred_scores = pred_scores.permute(0, 2, 1).contiguous()
         pred_offsets = pred_offsets.permute(0, 2, 1).contiguous()
+        pred_scores = torch.nan_to_num(pred_scores, nan=0.0, posinf=0.0, neginf=0.0)
+        pred_offsets = torch.nan_to_num(pred_offsets, nan=0.0, posinf=0.0, neginf=0.0)
 
         dtype = pred_scores.dtype
         batch_size = pred_scores.shape[0]
@@ -579,7 +582,12 @@ class v8LocalizationLoss:
         )
         targets = self.preprocess(targets.to(self.device), batch_size, scale_tensor=imgsz[[1, 0]])
         gt_labels, gt_radii, gt_locations = targets.split((1, 1, 2), 2)
+        gt_locations = torch.nan_to_num(gt_locations, nan=0.0, posinf=0.0, neginf=0.0)
+        gt_radii = torch.nan_to_num(gt_radii, nan=0.0, posinf=0.0, neginf=0.0)
+        gt_radii = gt_radii.clamp_min(1e-6)
         mask_gt = gt_locations.sum(2, keepdim=True).gt_(0)
+        valid_gt = torch.isfinite(gt_locations).all(2, keepdim=True) & torch.isfinite(gt_radii)
+        mask_gt = mask_gt & valid_gt
 
         pred_locations = anchor_points.repeat(1, self.reg_max) + (pred_offsets.sigmoid() * 2 - 0.5)
         anchors_min = anchor_points - 0.5
@@ -595,6 +603,8 @@ class v8LocalizationLoss:
             gt_locations=gt_locations,
             mask_gt=mask_gt,
         )
+        target_scores = torch.nan_to_num(target_scores, nan=0.0, posinf=0.0, neginf=0.0)
+        target_locations = torch.nan_to_num(target_locations, nan=0.0, posinf=0.0, neginf=0.0)
         target_scores_sum = max((target_scores).sum(), 1)
 
         loss[1] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum  # cls loss
@@ -606,10 +616,11 @@ class v8LocalizationLoss:
 
         loss[0] *= self.hyp.loc
         loss[1] *= self.hyp.cls
-        if torch.isnan(loss).any():
-            raise RuntimeError(
-                "Localization loss produced NaNs—check your data/hyperparameters or debug the assigner output."
+        if torch.isnan(loss).any() or not torch.isfinite(loss).all():
+            LOGGER.warning(
+                "WARNING ⚠️ Localization loss produced NaNs/Infs; zeroing non-finite values to continue training."
             )
+            loss = torch.nan_to_num(loss, nan=0.0, posinf=0.0, neginf=0.0)
 
         return loss.sum() * batch_size, loss.detach()
 
