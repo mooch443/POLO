@@ -287,7 +287,8 @@ class Locate(nn.Module):
     def forward(self, x: list[torch.Tensor]):
         """Concatenate and return predicted coordinates and class probabilities."""
         # Run locate head in FP32 to avoid AMP overflow producing NaNs
-        if not self._fp32_head:
+        w_dtype = self.cv2[0][0].conv.weight.dtype
+        if (not self._fp32_head) or (w_dtype != torch.float32):
             self.cv2 = self.cv2.float()
             self.cv3 = self.cv3.float()
             self._fp32_head = True
