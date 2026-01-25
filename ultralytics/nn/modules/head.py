@@ -11,7 +11,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.init import constant_, xavier_uniform_
 
-from ultralytics.utils import LOGGER, NOT_MACOS14
+from ultralytics.utils import NOT_MACOS14
 from ultralytics.utils.tal import dist2bbox, dist2rbox, make_anchors
 from ultralytics.utils.torch_utils import TORCH_1_11, autocast, fuse_conv_and_bn, smart_inference_mode
 
@@ -282,7 +282,6 @@ class Locate(nn.Module):
         )
         self.cv3 = nn.ModuleList(nn.Sequential(Conv(x, c3, 3), Conv(c3, c3, 3), nn.Conv2d(c3, self.nc, 1)) for x in ch)
         self._fp32_head = False
-        self._dtype_logged = False
 
     def forward(self, x: list[torch.Tensor]):
         """Concatenate and return predicted coordinates and class probabilities."""
@@ -295,10 +294,6 @@ class Locate(nn.Module):
         with autocast(enabled=False):
             for i in range(self.nl):
                 xi = x[i].float()
-                if not self._dtype_logged:
-                    w_dtype = self.cv2[i][0].conv.weight.dtype
-                    LOGGER.info(f"Locate head dtypes: x={xi.dtype}, w={w_dtype}")
-                    self._dtype_logged = True
                 x[i] = torch.cat((self.cv2[i](xi), self.cv3[i](xi)), 1)
         if self.training:  # Training path
             return x

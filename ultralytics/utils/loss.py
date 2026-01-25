@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import json
 import math
-from pathlib import Path
 from typing import Any
 
 import torch
@@ -12,7 +10,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from ultralytics.utils.metrics import OKS_SIGMA, RLE_WEIGHT
-from ultralytics.utils import LOGGER
 from ultralytics.utils.ops import crop_mask, xywh2xyxy, xyxy2xywh
 from ultralytics.utils import tal as tal_utils
 from ultralytics.utils.tal import dist2bbox, dist2rbox, make_anchors
@@ -538,8 +535,6 @@ class v8LocalizationLoss:
 
         self.assigner = LocTaskAlignedAssigner(topk=10, num_classes=self.nc, alpha=0.5, beta=6.0)
         self.proj = torch.arange(m.reg_max, dtype=torch.float, device=device)
-        self._nan_warned = False
-        self._nan_dumped = False
 
     def preprocess(self, targets, batch_size, scale_tensor):
         """Preprocess targets to per-image tensors."""
@@ -567,20 +562,6 @@ class v8LocalizationLoss:
 
         pred_scores = pred_scores.permute(0, 2, 1).contiguous()
         pred_offsets = pred_offsets.permute(0, 2, 1).contiguous()
-        if not self._nan_warned:
-            bad_pred_scores = ~torch.isfinite(pred_scores)
-            bad_pred_offsets = ~torch.isfinite(pred_offsets)
-            if bad_pred_scores.any() or bad_pred_offsets.any():
-                LOGGER.warning(
-                    "WARNING ⚠️ non-finite preds detected in locate loss. "
-                    f"scores_bad={int(bad_pred_scores.sum())}, offsets_bad={int(bad_pred_offsets.sum())}"
-                )
-                self._nan_warned = True
-                if not self._nan_dumped:
-                    self._dump_nan_debug(batch, pred_scores, pred_offsets, stage="preds", feats=feats)
-
-        pred_scores = torch.nan_to_num(pred_scores, nan=0.0, posinf=0.0, neginf=0.0)
-        pred_offsets = torch.nan_to_num(pred_offsets, nan=0.0, posinf=0.0, neginf=0.0)
 
         dtype = pred_scores.dtype
         batch_size = pred_scores.shape[0]
@@ -598,24 +579,7 @@ class v8LocalizationLoss:
         )
         targets = self.preprocess(targets.to(self.device), batch_size, scale_tensor=imgsz[[1, 0]])
         gt_labels, gt_radii, gt_locations = targets.split((1, 1, 2), 2)
-        if not self._nan_warned:
-            bad_gt_locations = ~torch.isfinite(gt_locations)
-            bad_gt_radii = ~torch.isfinite(gt_radii)
-            if bad_gt_locations.any() or bad_gt_radii.any():
-                LOGGER.warning(
-                    "WARNING ⚠️ non-finite targets detected in locate loss. "
-                    f"loc_bad={int(bad_gt_locations.sum())}, radii_bad={int(bad_gt_radii.sum())}"
-                )
-                self._nan_warned = True
-                if not self._nan_dumped:
-                    self._dump_nan_debug(batch, gt_locations, gt_radii, stage="targets")
-
-        gt_locations = torch.nan_to_num(gt_locations, nan=0.0, posinf=0.0, neginf=0.0)
-        gt_radii = torch.nan_to_num(gt_radii, nan=0.0, posinf=0.0, neginf=0.0)
-        gt_radii = gt_radii.clamp_min(1e-6)
         mask_gt = gt_locations.sum(2, keepdim=True).gt_(0)
-        valid_gt = torch.isfinite(gt_locations).all(2, keepdim=True) & torch.isfinite(gt_radii)
-        mask_gt = mask_gt.bool() & valid_gt
 
         pred_locations = anchor_points.repeat(1, self.reg_max) + (pred_offsets.sigmoid() * 2 - 0.5)
         anchors_min = anchor_points - 0.5
@@ -631,8 +595,6 @@ class v8LocalizationLoss:
             gt_locations=gt_locations,
             mask_gt=mask_gt,
         )
-        target_scores = torch.nan_to_num(target_scores, nan=0.0, posinf=0.0, neginf=0.0)
-        target_locations = torch.nan_to_num(target_locations, nan=0.0, posinf=0.0, neginf=0.0)
         target_scores_sum = max((target_scores).sum(), 1)
 
         loss[1] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum  # cls loss
@@ -644,62 +606,13 @@ class v8LocalizationLoss:
 
         loss[0] *= self.hyp.loc
         loss[1] *= self.hyp.cls
-        if torch.isnan(loss).any() or not torch.isfinite(loss).all():
-            LOGGER.warning(
-                "WARNING ⚠️ Localization loss produced NaNs/Infs; zeroing non-finite values to continue training."
+        if torch.isnan(loss).any():
+            raise RuntimeError(
+                "Localization loss produced NaNs—check your data/hyperparameters or debug the assigner output."
             )
-            loss = torch.nan_to_num(loss, nan=0.0, posinf=0.0, neginf=0.0)
 
         return loss.sum() * batch_size, loss.detach()
 
-    def _dump_nan_debug(
-        self,
-        batch: dict[str, torch.Tensor],
-        a: torch.Tensor,
-        b: torch.Tensor,
-        stage: str,
-        feats: list[torch.Tensor] | None = None,
-    ) -> None:
-        """Dump a one-time debug snapshot when non-finite values appear."""
-        try:
-            save_dir = getattr(self.hyp, "save_dir", None)
-            if save_dir is None:
-                return
-            save_dir = Path(save_dir)
-            save_dir.mkdir(parents=True, exist_ok=True)
-            out = save_dir / f"nan_debug_{stage}.json"
-
-            batch_idx = batch.get("batch_idx")
-            im_files = batch.get("im_file", [])
-            batch_idx_list = batch_idx.detach().cpu().tolist() if batch_idx is not None else []
-            data = {
-                "stage": stage,
-                "a_shape": list(a.shape),
-                "b_shape": list(b.shape),
-                "a_nonfinite": int((~torch.isfinite(a)).sum().item()),
-                "b_nonfinite": int((~torch.isfinite(b)).sum().item()),
-                "autocast": bool(torch.is_autocast_enabled()),
-                "batch_idx": batch_idx_list,
-                "im_files": [str(x) for x in im_files] if isinstance(im_files, (list, tuple)) else [],
-            }
-            if feats is not None:
-                feat_stats = []
-                for i, f in enumerate(feats):
-                    feat_stats.append(
-                        {
-                            "i": i,
-                            "shape": list(f.shape),
-                            "nonfinite": int((~torch.isfinite(f)).sum().item()),
-                            "min": float(f.min().item()) if f.numel() else None,
-                            "max": float(f.max().item()) if f.numel() else None,
-                        }
-                    )
-                data["feats"] = feat_stats
-            out.write_text(json.dumps(data, indent=2))
-            self._nan_dumped = True
-            LOGGER.warning(f"WARNING ⚠️ wrote NaN debug snapshot to {out}")
-        except Exception as exc:
-            LOGGER.warning(f"WARNING ⚠️ failed to write NaN debug snapshot: {exc}")
 
     def _build_loc_loss(self, loss_type: str) -> nn.Module:
         """Return the requested localization loss module."""
