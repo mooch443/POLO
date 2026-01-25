@@ -541,6 +541,25 @@ class LocalizationModel(BaseModel):
         if verbose:
             self.info()
             self.yaml = cfg if isinstance(cfg, dict) else yaml_model_load(cfg)  # cfg dict
+        self._nan_sanitized = False
+
+    def forward(self, x, *args, **kwargs):
+        """Forward pass with optional non-finite sanitization for locate outputs."""
+        y = super().forward(x, *args, **kwargs)
+
+        def _sanitize(t):
+            if torch.is_tensor(t):
+                if not torch.isfinite(t).all():
+                    if not self._nan_sanitized:
+                        LOGGER.warning("WARNING ⚠️ non-finite values in locate model outputs; sanitizing.")
+                        self._nan_sanitized = True
+                    return torch.nan_to_num(t, nan=0.0, posinf=0.0, neginf=0.0)
+                return t
+            if isinstance(t, (list, tuple)):
+                return type(t)(_sanitize(v) for v in t)
+            return t
+
+        return _sanitize(y)
 
     def _predict_augment(self, x):
         """Localization models do not support augmented prediction."""

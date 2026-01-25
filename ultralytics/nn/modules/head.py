@@ -13,7 +13,7 @@ from torch.nn.init import constant_, xavier_uniform_
 
 from ultralytics.utils import NOT_MACOS14
 from ultralytics.utils.tal import dist2bbox, dist2rbox, make_anchors
-from ultralytics.utils.torch_utils import TORCH_1_11, fuse_conv_and_bn, smart_inference_mode
+from ultralytics.utils.torch_utils import TORCH_1_11, autocast, fuse_conv_and_bn, smart_inference_mode
 
 from .block import DFL, SAVPE, BNContrastiveHead, ContrastiveHead, Proto, Proto26, RealNVP, Residual, SwiGLUFFN
 from .conv import Conv, DWConv
@@ -284,8 +284,11 @@ class Locate(nn.Module):
 
     def forward(self, x: list[torch.Tensor]):
         """Concatenate and return predicted coordinates and class probabilities."""
-        for i in range(self.nl):
-            x[i] = torch.cat((self.cv2[i](x[i]), self.cv3[i](x[i])), 1)
+        # Run locate head in FP32 to avoid AMP overflow producing NaNs
+        with autocast(enabled=False):
+            for i in range(self.nl):
+                xi = x[i].float()
+                x[i] = torch.cat((self.cv2[i](xi), self.cv3[i](xi)), 1)
         if self.training:  # Training path
             return x
 
