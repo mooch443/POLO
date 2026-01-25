@@ -281,10 +281,15 @@ class Locate(nn.Module):
             nn.Sequential(Conv(x, c2, 3), Conv(c2, c2, 3), nn.Conv2d(c2, self.reg_max * 2, 1)) for x in ch
         )
         self.cv3 = nn.ModuleList(nn.Sequential(Conv(x, c3, 3), Conv(c3, c3, 3), nn.Conv2d(c3, self.nc, 1)) for x in ch)
+        self._fp32_head = False
 
     def forward(self, x: list[torch.Tensor]):
         """Concatenate and return predicted coordinates and class probabilities."""
         # Run locate head in FP32 to avoid AMP overflow producing NaNs
+        if not self._fp32_head:
+            self.cv2 = self.cv2.float()
+            self.cv3 = self.cv3.float()
+            self._fp32_head = True
         with autocast(enabled=False):
             for i in range(self.nl):
                 xi = x[i].float()
