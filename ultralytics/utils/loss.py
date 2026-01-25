@@ -587,7 +587,7 @@ class v8LocalizationLoss:
         gt_radii = gt_radii.clamp_min(1e-6)
         mask_gt = gt_locations.sum(2, keepdim=True).gt_(0)
         valid_gt = torch.isfinite(gt_locations).all(2, keepdim=True) & torch.isfinite(gt_radii)
-        mask_gt = mask_gt & valid_gt
+        mask_gt = mask_gt.bool() & valid_gt
 
         pred_locations = anchor_points.repeat(1, self.reg_max) + (pred_offsets.sigmoid() * 2 - 0.5)
         anchors_min = anchor_points - 0.5
