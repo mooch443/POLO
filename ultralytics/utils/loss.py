@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import math
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -537,6 +539,7 @@ class v8LocalizationLoss:
         self.assigner = LocTaskAlignedAssigner(topk=10, num_classes=self.nc, alpha=0.5, beta=6.0)
         self.proj = torch.arange(m.reg_max, dtype=torch.float, device=device)
         self._nan_warned = False
+        self._nan_dumped = False
 
     def preprocess(self, targets, batch_size, scale_tensor):
         """Preprocess targets to per-image tensors."""
@@ -573,6 +576,8 @@ class v8LocalizationLoss:
                     f"scores_bad={int(bad_pred_scores.sum())}, offsets_bad={int(bad_pred_offsets.sum())}"
                 )
                 self._nan_warned = True
+                if not self._nan_dumped:
+                    self._dump_nan_debug(batch, pred_scores, pred_offsets, stage="preds")
 
         pred_scores = torch.nan_to_num(pred_scores, nan=0.0, posinf=0.0, neginf=0.0)
         pred_offsets = torch.nan_to_num(pred_offsets, nan=0.0, posinf=0.0, neginf=0.0)
@@ -602,6 +607,8 @@ class v8LocalizationLoss:
                     f"loc_bad={int(bad_gt_locations.sum())}, radii_bad={int(bad_gt_radii.sum())}"
                 )
                 self._nan_warned = True
+                if not self._nan_dumped:
+                    self._dump_nan_debug(batch, gt_locations, gt_radii, stage="targets")
 
         gt_locations = torch.nan_to_num(gt_locations, nan=0.0, posinf=0.0, neginf=0.0)
         gt_radii = torch.nan_to_num(gt_radii, nan=0.0, posinf=0.0, neginf=0.0)
@@ -644,6 +651,34 @@ class v8LocalizationLoss:
             loss = torch.nan_to_num(loss, nan=0.0, posinf=0.0, neginf=0.0)
 
         return loss.sum() * batch_size, loss.detach()
+
+    def _dump_nan_debug(self, batch: dict[str, torch.Tensor], a: torch.Tensor, b: torch.Tensor, stage: str) -> None:
+        """Dump a one-time debug snapshot when non-finite values appear."""
+        try:
+            save_dir = getattr(self.hyp, "save_dir", None)
+            if save_dir is None:
+                return
+            save_dir = Path(save_dir)
+            save_dir.mkdir(parents=True, exist_ok=True)
+            out = save_dir / f"nan_debug_{stage}.json"
+
+            batch_idx = batch.get("batch_idx")
+            im_files = batch.get("im_file", [])
+            batch_idx_list = batch_idx.detach().cpu().tolist() if batch_idx is not None else []
+            data = {
+                "stage": stage,
+                "a_shape": list(a.shape),
+                "b_shape": list(b.shape),
+                "a_nonfinite": int((~torch.isfinite(a)).sum().item()),
+                "b_nonfinite": int((~torch.isfinite(b)).sum().item()),
+                "batch_idx": batch_idx_list,
+                "im_files": [str(x) for x in im_files] if isinstance(im_files, (list, tuple)) else [],
+            }
+            out.write_text(json.dumps(data, indent=2))
+            self._nan_dumped = True
+            LOGGER.warning(f"WARNING ⚠️ wrote NaN debug snapshot to {out}")
+        except Exception as exc:
+            LOGGER.warning(f"WARNING ⚠️ failed to write NaN debug snapshot: {exc}")
 
     def _build_loc_loss(self, loss_type: str) -> nn.Module:
         """Return the requested localization loss module."""
