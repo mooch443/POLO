@@ -253,6 +253,8 @@ class LocalizationValidator(BaseValidator):
             names=self.names,
             on_plot=self.on_plot,
             conf_thres=self.args.conf,
+            show_labels=self.args.show_labels,
+            show_conf=self.args.show_conf,
         )  # pred
 
     def save_one_txt(self, predn, save_conf, shape, file):

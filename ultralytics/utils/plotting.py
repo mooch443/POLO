@@ -765,6 +765,59 @@ def save_one_box(
     return crop
 
 
+def _should_draw(is_label: bool, conf: float | None, conf_thres: float) -> bool:
+    """Return True when an annotation should be drawn at the current confidence threshold."""
+    return is_label or (conf is not None and float(conf) >= conf_thres)
+
+
+def _build_label_text(
+    name: str | int, is_label: bool, conf: float | None, show_labels: bool = True, show_conf: bool = True
+) -> str:
+    """Build annotation text respecting label/conf display flags."""
+    if not show_labels:
+        return ""
+    if is_label or conf is None or not show_conf:
+        return f"{name}"
+    return f"{name} {float(conf):.2f}"
+
+
+def _normalize_radii(radii: torch.Tensor | np.ndarray | list | tuple | float | int | None) -> np.ndarray:
+    """Normalize radii inputs to a flat float32 ndarray for consistent indexing/scaling."""
+    if radii is None:
+        return np.zeros(0, dtype=np.float32)
+    if isinstance(radii, torch.Tensor):
+        radii = radii.detach().cpu().numpy()
+    arr = np.asarray(radii)
+    if arr.size == 0:
+        return np.zeros(0, dtype=np.float32)
+    if arr.dtype == object:
+        flat = []
+        for value in arr.reshape(-1).tolist():
+            if isinstance(value, torch.Tensor):
+                flat.extend(value.detach().cpu().numpy().reshape(-1).tolist())
+            elif isinstance(value, np.ndarray):
+                flat.extend(value.reshape(-1).tolist())
+            else:
+                flat.append(value)
+        arr = np.asarray(flat, dtype=np.float32)
+    else:
+        arr = arr.astype(np.float32, copy=False)
+    return arr.reshape(-1)
+
+
+def _select_radii(radii: np.ndarray, idx: np.ndarray, n: int) -> np.ndarray | None:
+    """Return per-location radii for one image, broadcasting or resizing as needed."""
+    if radii.size == 0 or n == 0:
+        return None
+    if radii.size == idx.shape[0]:
+        return radii[idx]
+    if radii.size == 1:
+        return np.full((n,), float(radii[0]), dtype=np.float32)
+    if radii.size == n:
+        return radii
+    return np.resize(radii, n).astype(np.float32, copy=False)
+
+
 @threaded
 def plot_images(
     labels: dict[str, Any] | None = None,
@@ -785,6 +838,8 @@ def plot_images(
     max_subplots: int = 16,
     save: bool = True,
     conf_thres: float = 0.25,
+    show_labels: bool = True,
+    show_conf: bool = True,
 ) -> np.ndarray | None:
     """Plot image grid with labels, bounding boxes, masks, keypoints, or locations.
 
@@ -807,6 +862,8 @@ def plot_images(
         max_subplots (int): Maximum number of subplots in the image grid.
         save (bool): Whether to save the plotted image grid to a file.
         conf_thres (float): Confidence threshold for displaying detections.
+        show_labels (bool): Whether to draw class label text on annotations.
+        show_conf (bool): Whether to append confidence values to annotation text.
 
     Returns:
         (np.ndarray | None): Plotted image grid as a numpy array if save is False, None otherwise.
@@ -854,12 +911,30 @@ def plot_images(
         bboxes = bboxes.cpu().numpy()
     if isinstance(locations, torch.Tensor):
         locations = locations.cpu().numpy()
-    if isinstance(radii, torch.Tensor):
-        radii = radii.cpu().numpy()
+    radii = _normalize_radii(radii)
     if isinstance(masks, torch.Tensor):
         masks = masks.cpu().numpy().astype(int)
     if isinstance(kpts, torch.Tensor):
         kpts = kpts.cpu().numpy()
+    if isinstance(confs, torch.Tensor):
+        confs = confs.cpu().numpy()
+
+    if confs is not None:
+        conf_flat = np.asarray(confs).reshape(-1)
+        keep = conf_flat >= conf_thres
+        confs = conf_flat[keep]
+        cls = cls[keep]
+        batch_idx = batch_idx[keep]
+        if len(bboxes) and len(bboxes) == len(keep):
+            bboxes = bboxes[keep]
+        if len(locations) and len(locations) == len(keep):
+            locations = locations[keep]
+        if len(radii) and len(radii) == len(keep):
+            radii = radii[keep]
+        if len(kpts) and len(kpts) == len(keep):
+            kpts = kpts[keep]
+        if len(masks) and len(masks) == len(keep):
+            masks = masks[keep]
 
     # Handle 2-ch and n-ch images
     if images.size:
@@ -921,13 +996,14 @@ def plot_images(
                         c = classes[j]
                         color = colors(c)
                         c = names.get(c, c) if names else c
-                        if labels or conf[j] > conf_thres:
-                            label = f"{c}" if labels else f"{c} {conf[j]:.2f}"
+                        conf_j = float(conf[j]) if conf is not None else None
+                        if _should_draw(labels, conf_j, conf_thres):
+                            label = _build_label_text(c, labels, conf_j, show_labels=show_labels, show_conf=show_conf)
                             annotator.box_label(box, label, color=color)
                 elif len(locations):
                     locs = locations[idx]
                     conf = confs[idx] if confs is not None else None  # check for confidence presence (label vs pred)
-                    rads = radii[idx] if len(radii) else None
+                    rads = _select_radii(radii, idx, len(locs))
                     if len(locs):
                         if locs[:, :2].max() <= 1.1:  # if normalized with tolerance 0.1
                             locs[:, 0] *= w  # scale to pixels
@@ -935,7 +1011,6 @@ def plot_images(
                         elif scale < 1:  # absolute coords need scale if image scales
                             locs[:, :2] *= scale
                     if rads is not None:
-                        rads = np.squeeze(rads)
                         if np.size(rads):
                             if np.max(rads) <= 1.1:
                                 rads = rads * max(w, h)
@@ -947,18 +1022,19 @@ def plot_images(
                         c = classes[j]
                         color = colors(c)
                         c = names.get(c, c) if names else c
-                        if labels or conf[j] > conf_thres:
-                            label = f"{c}" if labels else f"{c} {conf[j]:.2f}"
+                        conf_j = float(conf[j]) if conf is not None else None
+                        if _should_draw(labels, conf_j, conf_thres):
+                            label = _build_label_text(c, labels, conf_j, show_labels=show_labels, show_conf=show_conf)
                             loc_radius = 4
                             if rads is not None and np.size(rads):
-                                rads_j = float(rads) if np.ndim(rads) == 0 else float(rads[j])
+                                rads_j = float(rads[j])
                                 loc_radius = max(1, int(round(rads_j)))
                             annotator.loc_label(loc, label, color=color, loc_radius=loc_radius)
 
             elif len(locations):
                 locs = locations[idx]
                 conf = confs[idx] if confs is not None else None  # check for confidence presence (label vs pred)
-                rads = radii[idx] if len(radii) else None
+                rads = _select_radii(radii, idx, len(locs))
                 if len(locs):
                     if locs[:, :2].max() <= 1.1:  # if normalized with tolerance 0.1
                         locs[:, 0] *= w  # scale to pixels
@@ -966,7 +1042,6 @@ def plot_images(
                     elif scale < 1:  # absolute coords need scale if image scales
                         locs[:, :2] *= scale
                 if rads is not None:
-                    rads = np.squeeze(rads)
                     if np.size(rads):
                         if np.max(rads) <= 1.1:
                             rads = rads * max(w, h)
@@ -978,20 +1053,23 @@ def plot_images(
                     c = classes[j]
                     color = colors(c)
                     c = names.get(c, c) if names else c
-                    if labels or conf[j] > conf_thres:
-                        label = f"{c}" if labels else f"{c} {conf[j]:.2f}"
+                    conf_j = float(conf[j]) if conf is not None else None
+                    if _should_draw(labels, conf_j, conf_thres):
+                        label = _build_label_text(c, labels, conf_j, show_labels=show_labels, show_conf=show_conf)
                         loc_radius = 4
                         if rads is not None and np.size(rads):
-                            rads_j = float(rads) if np.ndim(rads) == 0 else float(rads[j])
+                            rads_j = float(rads[j])
                             loc_radius = max(1, int(round(rads_j)))
                         annotator.loc_label(loc, label, color=color, loc_radius=loc_radius)
 
             elif len(classes):
-                for c in classes:
+                for j, c in enumerate(classes):
                     color = colors(c)
                     c = names.get(c, c) if names else c
-                    label = f"{c}" if labels else f"{c} {conf[0]:.1f}"
-                    annotator.text([x, y], label, txt_color=color, box_color=(64, 64, 64, 128))
+                    conf_j = float(conf[j]) if conf is not None else None
+                    if _should_draw(labels, conf_j, conf_thres):
+                        label = _build_label_text(c, labels, conf_j, show_labels=show_labels, show_conf=show_conf)
+                        annotator.text([x, y], label, txt_color=color, box_color=(64, 64, 64, 128))
 
             # Plot keypoints
             if len(kpts):
@@ -1005,7 +1083,8 @@ def plot_images(
                 kpts_[..., 0] += x
                 kpts_[..., 1] += y
                 for j in range(len(kpts_)):
-                    if labels or conf[j] > conf_thres:
+                    conf_j = float(conf[j]) if conf is not None else None
+                    if _should_draw(labels, conf_j, conf_thres):
                         annotator.kpts(kpts_[j], conf_thres=conf_thres)
 
             # Plot masks
@@ -1020,7 +1099,8 @@ def plot_images(
 
                 im = np.asarray(annotator.im).copy()
                 for j in range(len(image_masks)):
-                    if labels or conf[j] > conf_thres:
+                    conf_j = float(conf[j]) if conf is not None else None
+                    if _should_draw(labels, conf_j, conf_thres):
                         color = colors(classes[j])
                         mh, mw = image_masks[j].shape
                         if mh != h or mw != w:

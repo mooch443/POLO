@@ -376,26 +376,18 @@ class BaseValidator:
             if not valid_det.any():
                 continue
 
-            # Step 2: dedupe labels — for each label, keep the detection with the lowest cost
-            # Compute minimal proposed cost per label across detections
+            # Step 2: dedupe labels without scatter_reduce_ (MPS-safe)
             lbls = arg_label_per_det[valid_det]                         # (K,)
             costs = min_cost_per_det[valid_det]                         # (K,)
-            min_cost_per_lbl = torch.full((L,), inf, device=device, dtype=dor.dtype)
-            min_cost_per_lbl.scatter_reduce_(0, lbls, costs, reduce='amin', include_self=True)
-
-            # Among equal-cost ties for the same label, keep the smallest detection index
-            equal_best = valid_det & (min_cost_per_det == min_cost_per_lbl[arg_label_per_det])
-            if not equal_best.any():
-                continue
-
-            best_lbls = arg_label_per_det[equal_best]
-            best_dets = det_idx_all[equal_best]
-
-            # Tie-break: smallest detection index for each label
-            min_det_per_lbl = torch.full((L,), D, device=device, dtype=torch.long)
-            min_det_per_lbl.scatter_reduce_(0, best_lbls, best_dets, reduce='amin', include_self=True)
-
-            selected = equal_best & (det_idx_all == min_det_per_lbl[arg_label_per_det])
+            dets = det_idx_all[valid_det]                                # (K,)
+            selected = torch.zeros((D,), dtype=torch.bool, device=device)
+            for lbl in lbls.unique():
+                lbl_mask = lbls == lbl
+                lbl_costs = costs[lbl_mask]
+                lbl_dets = dets[lbl_mask]
+                min_cost = lbl_costs.min()
+                best_dets = lbl_dets[lbl_costs == min_cost]
+                selected[best_dets.min()] = True  # tie-break by smallest detection index
             correct[:, i] = selected
 
         return correct
@@ -480,4 +472,3 @@ class BaseValidator:
     def eval_json(self, stats):
         """Evaluate and return JSON format of prediction statistics."""
         raise NotImplementedError("eval_json function not implemented in validator")
- 
