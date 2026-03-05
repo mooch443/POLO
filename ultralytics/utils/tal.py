@@ -439,6 +439,7 @@ class LocTaskAlignedAssigner(nn.Module):
         gt_locs = gt_locations.unsqueeze(2).expand(-1, -1, na, -1)[mask_gt]
         gt_rad = gt_radii.unsqueeze(2).expand(-1, -1, na, -1)[mask_gt].squeeze()
         dor = loc_dor(gt_locs, pd_locs, gt_rad)
+        dor = torch.nan_to_num(dor, nan=float("inf"), posinf=float("inf"), neginf=0.0)
         dist_scores[mask_gt] = (1 - dor).clamp(0)
         align_metric = loc_scores.pow(self.alpha) * dist_scores.pow(self.beta)
         return align_metric, dist_scores

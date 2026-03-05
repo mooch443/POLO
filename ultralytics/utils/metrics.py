@@ -308,14 +308,15 @@ def smooth_bce(eps: float = 0.1) -> tuple[float, float]:
 def loc_dor_pw(loc1, loc2, radii, eps=1e-7):
     """Calculate pairwise Distance-over-Radius (DoR) between locations."""
     pairwise_dist = torch.cdist(loc1, loc2)
-    pw_dor = pairwise_dist / radii.view(loc1.shape[0], -1)
+    safe_radii = radii.view(loc1.shape[0], -1).abs().clamp_min(eps)
+    pw_dor = pairwise_dist / safe_radii
     return pw_dor + eps
 
 
 def loc_dor(loc1, loc2, radii, eps=1e-7):
     """Calculate Distance-over-Radius (DoR) for aligned location pairs."""
-    radii = radii.view(-1)
-    return torch.linalg.norm(loc1 - loc2, dim=-1) / radii + eps
+    safe_radii = radii.view(-1).abs().clamp_min(eps)
+    return torch.linalg.norm(loc1 - loc2, dim=-1) / safe_radii + eps
 
 
 class ConfusionMatrix(DataExportMixin):
