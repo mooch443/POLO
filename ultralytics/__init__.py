@@ -13,6 +13,12 @@ if not os.environ.get("OMP_NUM_THREADS"):
 from ultralytics.utils import ASSETS, SETTINGS
 from ultralytics.utils.checks import check_yolo as checks
 from ultralytics.utils.downloads import download
+from ultralytics.utils.sahi import (
+    apply_sahi_polo_monkeypatch,
+    install_sahi_polo_patch_permanently,
+    remove_sahi_polo_monkeypatch,
+    uninstall_sahi_polo_patch_permanently,
+)
 
 settings = SETTINGS
 
@@ -25,6 +31,10 @@ __all__ = (
     "checks",
     "download",
     "settings",
+    "apply_sahi_polo_monkeypatch",
+    "remove_sahi_polo_monkeypatch",
+    "install_sahi_polo_patch_permanently",
+    "uninstall_sahi_polo_patch_permanently",
 )
 
 if TYPE_CHECKING:
