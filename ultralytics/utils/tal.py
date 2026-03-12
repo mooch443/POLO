@@ -402,7 +402,8 @@ class LocTaskAlignedAssigner(nn.Module):
         pos_align_metrics = align_metric.amax(dim=-1, keepdim=True)  # b, max_num_obj
         pos_dist = (dist_scores * mask_pos).amax(dim=-1, keepdim=True)  # b, max_num_obj
         norm_align_metric = (align_metric * pos_dist / (pos_align_metrics + self.eps)).amax(-2).unsqueeze(-1)
-        target_scores = target_scores * norm_align_metric
+        norm_align_metric = torch.nan_to_num(norm_align_metric, nan=0.0, posinf=1.0, neginf=0.0)
+        target_scores = torch.nan_to_num(target_scores * norm_align_metric, nan=0.0, posinf=1.0, neginf=0.0)
 
         return target_labels, target_locations, target_scores, fg_mask.bool(), target_gt_idx
 
@@ -441,7 +442,10 @@ class LocTaskAlignedAssigner(nn.Module):
         dor = loc_dor(gt_locs, pd_locs, gt_rad)
         dor = torch.nan_to_num(dor, nan=float("inf"), posinf=float("inf"), neginf=0.0)
         dist_scores[mask_gt] = (1 - dor).clamp(0)
-        align_metric = loc_scores.pow(self.alpha) * dist_scores.pow(self.beta)
+        dist_scores = torch.nan_to_num(dist_scores, nan=0.0, posinf=0.0, neginf=0.0)
+        align_metric = torch.nan_to_num(
+            loc_scores.pow(self.alpha) * dist_scores.pow(self.beta), nan=0.0, posinf=0.0, neginf=0.0
+        )
         return align_metric, dist_scores
 
     def select_topk_candidates(self, metrics, largest=True, topk_mask=None):

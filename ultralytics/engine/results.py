@@ -228,6 +228,7 @@ class Results(SimpleClass, DataExportMixin):
         names: dict[int, str],
         boxes: torch.Tensor | None = None,
         locations: torch.Tensor | None = None,
+        location_radii: torch.Tensor | np.ndarray | None = None,
         masks: torch.Tensor | None = None,
         probs: torch.Tensor | None = None,
         keypoints: torch.Tensor | None = None,
@@ -242,6 +243,7 @@ class Results(SimpleClass, DataExportMixin):
             names (dict): A dictionary of class names.
             boxes (torch.Tensor | None): A 2D tensor of bounding box coordinates for each detection.
             locations (torch.Tensor | None): A 2D tensor of location coordinates for each detection.
+            location_radii (torch.Tensor | np.ndarray | None): Optional per-location radii for locate visualizations.
             masks (torch.Tensor | None): A 3D tensor of detection masks, where each mask is a binary image.
             probs (torch.Tensor | None): A 1D tensor of probabilities of each class for classification task.
             keypoints (torch.Tensor | None): A 2D tensor of keypoint coordinates for each detection.
@@ -258,7 +260,9 @@ class Results(SimpleClass, DataExportMixin):
         self.orig_img = orig_img
         self.orig_shape = orig_img.shape[:2]
         self.boxes = Boxes(boxes, self.orig_shape) if boxes is not None else None  # native size boxes
-        self.locations = Locations(locations, self.orig_shape) if locations is not None else None  # native size locs
+        self.locations = (
+            Locations(locations, self.orig_shape, radii=location_radii) if locations is not None else None
+        )  # native size locs
         self.masks = Masks(masks, self.orig_shape) if masks is not None else None  # native size or imgsz masks
         self.probs = Probs(probs) if probs is not None else None
         self.keypoints = Keypoints(keypoints, self.orig_shape) if keypoints is not None else None
@@ -306,6 +310,7 @@ class Results(SimpleClass, DataExportMixin):
         self,
         boxes: torch.Tensor | None = None,
         locations: torch.Tensor | None = None,
+        location_radii: torch.Tensor | np.ndarray | None = None,
         masks: torch.Tensor | None = None,
         probs: torch.Tensor | None = None,
         obb: torch.Tensor | None = None,
@@ -333,7 +338,8 @@ class Results(SimpleClass, DataExportMixin):
         if boxes is not None:
             self.boxes = Boxes(ops.clip_boxes(boxes, self.orig_shape), self.orig_shape)
         if locations is not None:
-            self.locations = Locations(ops.clip_locations(locations, self.orig_shape, remove_clipped=True), self.orig_shape)
+            clipped = ops.clip_locations(locations, self.orig_shape, remove_clipped=True)
+            self.locations = Locations(clipped, self.orig_shape, radii=location_radii)
         if masks is not None:
             self.masks = Masks(masks, self.orig_shape)
         if probs is not None:
@@ -462,6 +468,7 @@ class Results(SimpleClass, DataExportMixin):
         boxes: bool = True,
         locations: bool = True,
         loc_radius: int = 5,
+        conf_thres: float = 0.25,
         masks: bool = True,
         probs: bool = True,
         show: bool = False,
@@ -486,6 +493,7 @@ class Results(SimpleClass, DataExportMixin):
             boxes (bool): Whether to plot bounding boxes.
             locations (bool): Whether to plot locations.
             loc_radius (int): Radius of drawn location markers.
+            conf_thres (float): Confidence threshold for plotting detections/locations.
             masks (bool): Whether to plot masks.
             probs (bool): Whether to plot classification probabilities.
             show (bool): Whether to display the annotated image.
@@ -567,9 +575,13 @@ class Results(SimpleClass, DataExportMixin):
         # Plot Localization results
         if pred_locs is not None and show_locs:
             for l in reversed(pred_locs):
-                c, conf, id = int(l.cls), float(l.conf) if conf else None, None if l.id is None else int(l.id.item())
+                c = int(l.cls)
+                conf_v = float(l.conf) if conf else None
+                if conf_v is not None and conf_v < conf_thres:
+                    continue
+                id = None if l.id is None else int(l.id.item())
                 name = ("" if id is None else f"id:{id} ") + names[c]
-                label = (f"{name} {conf:.2f}" if conf else name) if labels else None
+                label = (f"{name} {conf_v:.2f}" if conf_v is not None else name) if labels else None
                 loc = l.xy
                 if isinstance(loc, torch.Tensor):
                     loc = loc.squeeze()
@@ -577,7 +589,8 @@ class Results(SimpleClass, DataExportMixin):
                     loc = np.squeeze(loc)
                 if hasattr(loc, "ndim") and loc.ndim > 1:
                     loc = loc[0]
-                annotator.loc_label(loc, label, color=colors(c, True), loc_radius=loc_radius)
+                radius = float(l.radius) if l.radius is not None else float(loc_radius)
+                annotator.loc_label(loc, label, color=colors(c, True), loc_radius=max(1, int(round(radius))))
         # Plot Classify results
         if pred_probs is not None and show_probs:
             text = "\n".join(f"{names[j] if names else j} {pred_probs.data[j]:.2f}" for j in pred_probs.top5)
@@ -1098,7 +1111,7 @@ class Locations(BaseTensor):
         to(device, dtype=None): Moves the locations to the specified device.
     """
 
-    def __init__(self, locations, orig_shape) -> None:
+    def __init__(self, locations, orig_shape, radii: torch.Tensor | np.ndarray | None = None) -> None:
         """
         Initialize the Locations class.
 
@@ -1107,6 +1120,7 @@ class Locations(BaseTensor):
                 shape (num_locs, 4) or (num_locs, 5). The last two columns contain confidence and class values.
                 If present, the third last column contains track IDs.
             orig_shape (tuple): Original image size, in the format (height, width).
+            radii (torch.Tensor | numpy.ndarray | None): Optional per-location radii aligned with `locations`.
         """
         if locations.ndim == 1:
             locations = locations[None, :]
@@ -1115,6 +1129,9 @@ class Locations(BaseTensor):
         super().__init__(locations, orig_shape)
         self.is_track = n == 5
         self.orig_shape = orig_shape
+        if radii is not None:
+            radii = radii[None, ...] if getattr(radii, "ndim", 1) == 0 else radii
+        self.radii = radii
 
     @property
     def xy(self):
@@ -1137,6 +1154,15 @@ class Locations(BaseTensor):
         return self.data[:, -3] if self.is_track else None
 
     @property
+    def radius(self):
+        """Return the per-location radius if available."""
+        if self.radii is None:
+            return None
+        if isinstance(self.radii, torch.Tensor):
+            return self.radii.reshape(-1)[0] if self.radii.numel() else None
+        return np.asarray(self.radii).reshape(-1)[0] if np.size(self.radii) else None
+
+    @property
     @lru_cache(maxsize=2)
     def xyn(self):
         """Return the locations in xy format normalized by original image size."""
@@ -1144,6 +1170,35 @@ class Locations(BaseTensor):
         xy[..., 0] /= self.orig_shape[1]
         xy[..., 1] /= self.orig_shape[0]
         return xy
+
+    def cpu(self):
+        """Return a copy of the locations stored in CPU memory."""
+        if isinstance(self.data, np.ndarray):
+            return self
+        radii = self.radii.cpu() if isinstance(self.radii, torch.Tensor) else self.radii
+        return self.__class__(self.data.cpu(), self.orig_shape, radii=radii)
+
+    def numpy(self):
+        """Return a copy of the locations with NumPy backing arrays."""
+        if isinstance(self.data, np.ndarray):
+            return self
+        radii = self.radii.numpy() if isinstance(self.radii, torch.Tensor) else self.radii
+        return self.__class__(self.data.numpy(), self.orig_shape, radii=radii)
+
+    def cuda(self):
+        """Move the locations to GPU memory."""
+        radii = torch.as_tensor(self.radii).cuda() if self.radii is not None else None
+        return self.__class__(torch.as_tensor(self.data).cuda(), self.orig_shape, radii=radii)
+
+    def to(self, *args, **kwargs):
+        """Return a copy of the locations on the specified device/dtype."""
+        radii = torch.as_tensor(self.radii).to(*args, **kwargs) if self.radii is not None else None
+        return self.__class__(torch.as_tensor(self.data).to(*args, **kwargs), self.orig_shape, radii=radii)
+
+    def __getitem__(self, idx):
+        """Return indexed locations while preserving any per-location radii."""
+        radii = None if self.radii is None else self.radii[idx]
+        return self.__class__(self.data[idx], self.orig_shape, radii=radii)
 
 
 class Masks(BaseTensor):

@@ -29,8 +29,19 @@ class LocalizationValidator(BaseValidator):
     """
     def __init__(self, dataloader=None, save_dir=None, args=None, _callbacks=None):
         """Initialize detection model with necessary variables and settings."""
-        radii = None if "radii" not in args else args.pop("radii")
-        dor = None if "dor" not in args else args.pop("dor")
+        args = {} if args is None else args
+        if isinstance(args, dict):
+            args = {**args, "task": "locate"}
+            radii = args.pop("radii", None)
+            dor = args.pop("dor", None)
+        else:
+            setattr(args, "task", "locate")
+            radii = getattr(args, "radii", None)
+            dor = getattr(args, "dor", None)
+            if hasattr(args, "radii"):
+                delattr(args, "radii")
+            if hasattr(args, "dor"):
+                delattr(args, "dor")
 
         super().__init__(dataloader, save_dir, args, _callbacks)
         self.nt_per_class = None
@@ -38,6 +49,8 @@ class LocalizationValidator(BaseValidator):
         self.class_map = None
 
         self.args.task = "locate"
+        self.args.conf = ops.resolve_locate_conf(self.args.conf)
+        self.args.locate_val_mode = ops.resolve_locate_val_mode(getattr(self.args, "locate_val_mode", None))
         self.radii = radii
         self.dor = dor
         self.metrics = LocMetrics(save_dir=self.save_dir, on_plot=self.on_plot)
@@ -94,10 +107,10 @@ class LocalizationValidator(BaseValidator):
         return ops.non_max_suppression_loc(
             prediction=preds,
             conf_thres=self.args.conf,
-            dor_thres= self.dor if self.dor else self.args.dor,
+            dor_thres=self.dor if self.dor else self.args.dor,
             radii=self.radii if self.radii is not None else self.data["radii"],
             labels=self.lb,
-            multi_label=True,
+            multi_label=self.args.locate_val_mode == "legacy",
             agnostic=self.args.single_cls,
             max_det=self.args.max_det,
         )
@@ -241,12 +254,15 @@ class LocalizationValidator(BaseValidator):
     def plot_predictions(self, batch, preds, ni):
         """Plots predicted locations on input images and saves the result."""
         batch_id, cls_id, locs, confs = output_to_target_loc(preds, max_det=self.args.max_det)
+        radii_map = self.radii if self.radii is not None else self.data["radii"]
+        radii = ops.generate_radii_t(radii=radii_map, cls=torch.as_tensor(cls_id).view(-1, 1))
 
         plot_images(
             images=batch["img"],
             batch_idx=batch_id,
             cls=cls_id,
             locations=locs,
+            radii=radii,
             confs=confs,
             paths=batch["im_file"],
             fname=self.save_dir / f"val_batch{ni}_pred.jpg",

@@ -440,6 +440,7 @@ class BasePredictor:
                 line_width=self.args.line_width,
                 boxes=self.args.show_boxes,
                 conf=self.args.show_conf,
+                conf_thres=self.args.conf,
                 labels=self.args.show_labels,
                 im_gpu=None if self.args.retina_masks else im[i],
             )

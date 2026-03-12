@@ -640,6 +640,19 @@ def loc_nms(preds: torch.Tensor, scores: torch.Tensor, radii: torch.Tensor, dor_
     return order[keep]
 
 
+def resolve_locate_conf(conf: float | None) -> float:
+    """Return the effective confidence threshold for locate predict/val flows."""
+    return 0.25 if conf is None else float(conf)
+
+
+def resolve_locate_val_mode(mode: str | None) -> str:
+    """Normalize and validate the locate validation postprocess mode."""
+    mode = "fast" if mode is None else str(mode).lower()
+    if mode not in {"fast", "legacy"}:
+        raise ValueError(f"Unsupported locate_val_mode '{mode}'. Expected 'fast' or 'legacy'.")
+    return mode
+
+
 def non_max_suppression_loc(
     prediction: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
     conf_thres: float = 0.25,
@@ -658,10 +671,13 @@ def non_max_suppression_loc(
     nc = prediction.shape[1] - 2
     max_wh = 4096
     max_nms = 30000
+    xc = prediction[:, 2:].amax(1) > conf_thres
     output = [torch.zeros((0, 4), device=prediction.device)] * bs
 
-    for xi, pred in enumerate(prediction):
-        x = pred.transpose(0, 1)  # (num_locs, 2+nc)
+    prediction = prediction.transpose(-1, -2)  # (bs, num_locs, 2+nc)
+
+    for xi, x in enumerate(prediction):
+        x = x[xc[xi]]
         if labels and len(labels[xi]):
             lb = labels[xi].to(x.device)
             if lb.numel():
@@ -669,6 +685,9 @@ def non_max_suppression_loc(
                 v[:, :2] = lb[:, 1:3]
                 v[torch.arange(len(lb)), (lb[:, 0].long() + 2)] = 1.0
                 x = torch.cat((x, v), 0)
+
+        if not x.shape[0]:
+            continue
 
         if multi_label:
             i, j = (x[:, 2:] > conf_thres).nonzero(as_tuple=False).T

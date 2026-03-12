@@ -555,63 +555,75 @@ class v8LocalizationLoss:
 
     def __call__(self, preds, batch):
         """Calculate the sum of the loss for cls and loc multiplied by batch size."""
-        loss = torch.zeros(2, device=self.device)  # cls, loc
         feats = preds[1] if isinstance(preds, tuple) else preds
-        pred_offsets, pred_scores = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2).split(
-            (self.reg_max * 2, self.nc), 1)
+        with autocast(enabled=False):
+            loss = torch.zeros(2, device=self.device, dtype=torch.float32)  # cls, loc
+            feats = [xi.float() for xi in feats]
+            pred_offsets, pred_scores = torch.cat(
+                [xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2
+            ).split((self.reg_max * 2, self.nc), 1)
 
-        pred_scores = pred_scores.permute(0, 2, 1).contiguous()
-        pred_offsets = pred_offsets.permute(0, 2, 1).contiguous()
+            pred_scores = pred_scores.permute(0, 2, 1).contiguous().float()
+            pred_offsets = pred_offsets.permute(0, 2, 1).contiguous().float()
+            pred_scores = torch.nan_to_num(pred_scores, nan=0.0, posinf=20.0, neginf=-20.0)
+            pred_offsets = torch.nan_to_num(pred_offsets, nan=0.0, posinf=20.0, neginf=-20.0)
 
-        dtype = pred_scores.dtype
-        batch_size = pred_scores.shape[0]
-        imgsz = torch.tensor(feats[0].shape[2:], device=self.device, dtype=dtype) * self.stride[0]
-        anchor_points, stride_tensor = make_anchors(feats=feats, strides=self.stride, grid_cell_offset=0)
+            batch_size = pred_scores.shape[0]
+            imgsz = torch.tensor(feats[0].shape[2:], device=self.device, dtype=torch.float32) * self.stride[0]
+            anchor_points, stride_tensor = make_anchors(feats=feats, strides=self.stride, grid_cell_offset=0)
+            anchor_points = anchor_points.float()
+            stride_tensor = stride_tensor.float()
 
-        targets = torch.cat(
-            (
-                batch["batch_idx"].view(-1, 1),
-                batch["cls"].view(-1, 1),
-                batch["radii"].view(-1, 1),
-                batch["locations"],
-            ),
-            1,
-        )
-        targets = self.preprocess(targets.to(self.device), batch_size, scale_tensor=imgsz[[1, 0]])
-        gt_labels, gt_radii, gt_locations = targets.split((1, 1, 2), 2)
-        mask_gt = gt_locations.sum(2, keepdim=True).gt_(0)
-
-        pred_locations = anchor_points.repeat(1, self.reg_max) + (pred_offsets.sigmoid() * 2 - 0.5)
-        anchors_min = anchor_points - 0.5
-        anchors_max = anchor_points + 1.5
-
-        _, target_locations, target_scores, fg_mask, _ = self.assigner(
-            pd_scores=pred_scores.detach().sigmoid(),
-            pd_locations=(pred_locations.detach() * stride_tensor).type(gt_locations.dtype),
-            anc_min=anchors_min * stride_tensor,
-            anc_max=anchors_max * stride_tensor,
-            gt_labels=gt_labels,
-            gt_radii=gt_radii,
-            gt_locations=gt_locations,
-            mask_gt=mask_gt,
-        )
-        target_scores_sum = max((target_scores).sum(), 1)
-
-        loss[1] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum  # cls loss
-        if fg_mask.sum():
-            target_locations /= stride_tensor
-            loss[0] = self.loc_loss(
-                pred_locations=pred_locations, target_locations=target_locations, fg_mask=fg_mask
+            targets = torch.cat(
+                (
+                    batch["batch_idx"].view(-1, 1),
+                    batch["cls"].view(-1, 1),
+                    batch["radii"].view(-1, 1),
+                    batch["locations"],
+                ),
+                1,
             )
-
-        loss[0] *= self.hyp.loc
-        loss[1] *= self.hyp.cls
-        if torch.isnan(loss).any():
-            raise RuntimeError(
-                "Localization loss produced NaNs—check your data/hyperparameters or debug the assigner output."
+            targets = self.preprocess(
+                targets.to(self.device, dtype=torch.float32), batch_size, scale_tensor=imgsz[[1, 0]]
             )
+            gt_labels, gt_radii, gt_locations = targets.split((1, 1, 2), 2)
+            mask_gt = gt_locations.sum(2, keepdim=True).gt_(0)
 
-        return loss.sum() * batch_size, loss.detach()
+            pred_locations = anchor_points.repeat(1, self.reg_max) + (pred_offsets.sigmoid() * 2 - 0.5)
+            pred_locations = torch.nan_to_num(pred_locations, nan=0.0, posinf=0.0, neginf=0.0)
+            anchors_min = anchor_points - 0.5
+            anchors_max = anchor_points + 1.5
+
+            _, target_locations, target_scores, fg_mask, _ = self.assigner(
+                pd_scores=pred_scores.detach().sigmoid(),
+                pd_locations=(pred_locations.detach() * stride_tensor).type(gt_locations.dtype),
+                anc_min=anchors_min * stride_tensor,
+                anc_max=anchors_max * stride_tensor,
+                gt_labels=gt_labels,
+                gt_radii=gt_radii,
+                gt_locations=gt_locations,
+                mask_gt=mask_gt,
+            )
+            target_locations = torch.nan_to_num(target_locations, nan=0.0, posinf=0.0, neginf=0.0)
+            target_scores = torch.nan_to_num(target_scores, nan=0.0, posinf=1.0, neginf=0.0).float()
+            target_scores_sum = target_scores.sum().clamp_min(1.0)
+
+            loss[1] = self.bce(pred_scores, target_scores).sum() / target_scores_sum  # cls loss
+            if fg_mask.sum():
+                target_locations = target_locations / stride_tensor
+                loss[0] = self.loc_loss(
+                    pred_locations=pred_locations, target_locations=target_locations, fg_mask=fg_mask
+                )
+
+            loss[0] *= self.hyp.loc
+            loss[1] *= self.hyp.cls
+            if not torch.isfinite(loss).all():
+                raise RuntimeError(
+                    "Localization loss produced NaN/Inf after FP32 AMP-safe loss processing; "
+                    "check labels/radii and assigner outputs."
+                )
+
+            return loss.sum() * batch_size, loss.detach()
 
 
     def _build_loc_loss(self, loss_type: str) -> nn.Module:
