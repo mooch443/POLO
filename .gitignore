@@ -205,3 +205,6 @@ args.yaml
 results.csv
 # P0 specific
 /P0_results/
+
+# CI test asset cache
+.ultralytics_cache/

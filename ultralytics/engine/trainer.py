@@ -27,7 +27,8 @@ from torch import functional as F
 
 from ultralytics import __version__
 from ultralytics.cfg import get_cfg, get_save_dir
-from ultralytics.data.utils import check_cls_dataset, check_det_dataset
+from ultralytics.data.utils import check_cls_dataset, check_det_dataset, convert_ndjson_to_yolo_if_needed
+from ultralytics.nn.distill_model import DistillationModel
 from ultralytics.nn.tasks import load_checkpoint
 from ultralytics.optim import MuSGD
 from ultralytics.utils import (
@@ -86,16 +87,16 @@ class BaseTrainer:
         start_epoch (int): Starting epoch for training.
         device (torch.device): Device to use for training.
         amp (bool): Flag to enable AMP (Automatic Mixed Precision).
-        scaler (amp.GradScaler): Gradient scaler for AMP.
-        data (str): Path to data.
-        ema (nn.Module): EMA (Exponential Moving Average) of the model.
+        scaler (torch.amp.GradScaler): Gradient scaler for AMP.
+        data (dict): Dataset dictionary containing paths and metadata.
+        ema (ModelEMA): EMA (Exponential Moving Average) of the model.
         resume (bool): Resume training from a checkpoint.
-        lf (nn.Module): Loss function.
+        lf (callable): Learning rate scheduling function.
         scheduler (torch.optim.lr_scheduler._LRScheduler): Learning rate scheduler.
         best_fitness (float): The best fitness value achieved.
         fitness (float): Current fitness value.
-        loss (float): Current loss value.
-        tloss (float): Total loss value.
+        loss (torch.Tensor): Current loss value.
+        tloss (torch.Tensor): Running mean of loss items.
         loss_names (list): List of loss names.
         csv (Path): Path to results CSV file.
         metrics (dict): Dictionary of metrics.
@@ -103,7 +104,7 @@ class BaseTrainer:
 
     Methods:
         train: Execute the training process.
-        validate: Run validation on the test set.
+        validate: Run validation on the val set.
         save_model: Save model training checkpoints.
         get_dataset: Get train and validation datasets.
         setup_model: Load, create, or download model.
@@ -115,13 +116,13 @@ class BaseTrainer:
         >>> trainer.train()
     """
 
-    def __init__(self, cfg=DEFAULT_CFG, overrides=None, _callbacks=None):
+    def __init__(self, cfg=DEFAULT_CFG, overrides=None, _callbacks: dict | None = None):
         """Initialize the BaseTrainer class.
 
         Args:
-            cfg (str, optional): Path to a configuration file.
+            cfg (str | dict | SimpleNamespace, optional): Path to a configuration file or configuration object.
             overrides (dict, optional): Configuration overrides.
-            _callbacks (list, optional): List of callback functions.
+            _callbacks (dict, optional): Dictionary of callback functions.
         """
         self.hub_session = overrides.pop("session", None)  # HUB
         self.args = get_cfg(cfg, overrides)
@@ -218,7 +219,7 @@ class BaseTrainer:
             callback(self)
 
     def train(self):
-        """Allow device='', device=None on Multi-GPU systems to default to device=0."""
+        """Execute the training process, using DDP subprocess for multi-GPU or direct training for single-GPU."""
         # Run subprocess if DDP training, else train normally
         if self.ddp:
             # Argument checks
@@ -232,14 +233,16 @@ class BaseTrainer:
                 )
 
             # Command
-            cmd, file = generate_ddp_command(self)
+            cmd, file = None, None
             try:
+                cmd, file = generate_ddp_command(self)
                 LOGGER.info(f"{colorstr('DDP:')} debug command {' '.join(cmd)}")
                 subprocess.run(cmd, check=True)
             except Exception as e:
                 raise e
             finally:
-                ddp_cleanup(self, str(file))
+                if file is not None:
+                    ddp_cleanup(self, str(file))
 
         else:
             self._do_train()
@@ -264,13 +267,43 @@ class BaseTrainer:
             world_size=self.world_size,
         )
 
+    def _build_train_pipeline(self):
+        """Build dataloaders, optimizer, and scheduler for current batch size."""
+        batch_size = self.batch_size // max(self.world_size, 1)
+        self.train_loader = self.get_dataloader(
+            self.data["train"], batch_size=batch_size, rank=LOCAL_RANK, mode="train"
+        )
+        # Note: When training DOTA dataset, double batch size could get OOM on images with >2000 objects.
+        self.test_loader = self.get_dataloader(
+            self.data.get("val") or self.data.get("test"),
+            batch_size=batch_size if self.args.task in {"obb", "semantic"} else batch_size * 2,
+            rank=LOCAL_RANK,
+            mode="val",
+        )
+        self.accumulate = max(round(self.args.nbs / self.batch_size), 1)  # accumulate loss before optimizing
+        weight_decay = self.args.weight_decay * self.batch_size * self.accumulate / self.args.nbs  # scale weight_decay
+        iterations = math.ceil(len(self.train_loader.dataset) / max(self.batch_size, self.args.nbs)) * self.epochs
+        self.optimizer = self.build_optimizer(
+            model=self.model,
+            name=self.args.optimizer,
+            lr=self.args.lr0,
+            momentum=self.args.momentum,
+            decay=weight_decay,
+            iterations=iterations,
+        )
+        self._setup_scheduler()
+
     def _setup_train(self):
-        """Build dataloaders and optimizer on correct rank process."""
+        """Configure model, optimizer, dataloaders, and training utilities before the training loop."""
         ckpt = self.setup_model()
         self.model = self.model.to(self.device)
         self.set_model_attributes()
 
-        # Compile model
+        # Compile model (knowledge distillation runs the wrapped model eagerly and relies on
+        # find_unused_parameters under DDP for the frozen teacher, so disable compilation when distilling)
+        if self.args.distill_model is not None and self.args.compile:
+            LOGGER.warning("'compile' is not supported with knowledge distillation and will be disabled.")
+            self.args.compile = False
         self.model = attempt_compile(self.model, device=self.device, mode=self.args.compile)
 
         # Freeze layers
@@ -283,6 +316,8 @@ class BaseTrainer:
         )
         always_freeze_names = [".dfl", ".locInf"]  # always freeze these layers
         freeze_layer_names = [f"model.{x}." for x in freeze_list] + always_freeze_names
+        if isinstance(unwrap_model(self.model), DistillationModel):
+            freeze_layer_names.append("teacher_model.")
         self.freeze_layer_names = freeze_layer_names
         for k, v in self.model.named_parameters():
             # v.register_hook(lambda x: torch.nan_to_num(x))  # NaN to 0 (commented for erratic training results)
@@ -295,6 +330,11 @@ class BaseTrainer:
                     "See ultralytics.engine.trainer for customization of frozen layers."
                 )
                 v.requires_grad = True
+        if not any(v.requires_grad for v in self.model.parameters()):
+            raise RuntimeError(
+                f"'freeze={self.args.freeze}' froze the entire model with no trainable parameters left. "
+                f"Reduce 'freeze' or pass a list of specific layer indices."
+            )
 
         # Check AMP
         self.amp = torch.tensor(self.args.amp).to(self.device)  # True or False
@@ -303,64 +343,53 @@ class BaseTrainer:
             self.amp = torch.tensor(check_amp(self.model), device=self.device)
             callbacks.default_callbacks = callbacks_backup  # restore callbacks
         if RANK > -1 and self.world_size > 1:  # DDP
-            dist.broadcast(self.amp.int(), src=0)  # broadcast from rank 0 to all other ranks; gloo errors with boolean
+            self.amp = self.amp.int()  # gloo errors with boolean
+            dist.broadcast(self.amp, src=0)  # broadcast from rank 0 to all other ranks
         self.amp = bool(self.amp)  # as boolean
         self.scaler = (
             torch.amp.GradScaler("cuda", enabled=self.amp) if TORCH_2_4 else torch.cuda.amp.GradScaler(enabled=self.amp)
         )
-        if self.world_size > 1:
-            self.model = nn.parallel.DistributedDataParallel(self.model, device_ids=[RANK], find_unused_parameters=True)
-
         # Check imgsz
         gs = max(int(self.model.stride.max() if hasattr(self.model, "stride") else 32), 32)  # grid size (max stride)
         self.args.imgsz = check_imgsz(self.args.imgsz, stride=gs, floor=gs, max_dim=1)
         self.stride = gs  # for multiscale training
 
+        # resume training would directly load DistillationModel so check here
+        if self.args.distill_model is not None and not isinstance(unwrap_model(self.model), DistillationModel):
+            self.model = DistillationModel(student_model=self.model, teacher_model=self.args.distill_model)
+        if self.world_size > 1:
+            # static_graph=True permits params used >1 time per forward (e.g. flow_model in
+            # o2m+o2o pose loss branches) under torch.compile.
+            self.model = nn.parallel.DistributedDataParallel(
+                self.model,
+                device_ids=[RANK],
+                static_graph=bool(self.args.compile),
+                find_unused_parameters=not bool(self.args.compile),
+            )
+
         # Batch size
         if self.batch_size < 1 and RANK == -1:  # single-GPU only, estimate best batch size
             self.args.batch = self.batch_size = self.auto_batch()
 
-        # Dataloaders
-        batch_size = self.batch_size // max(self.world_size, 1)
-        self.train_loader = self.get_dataloader(
-            self.data["train"], batch_size=batch_size, rank=LOCAL_RANK, mode="train"
-        )
-        # Note: When training DOTA dataset, double batch size could get OOM on images with >2000 objects.
-        self.test_loader = self.get_dataloader(
-            self.data.get("val") or self.data.get("test"),
-            batch_size=batch_size if self.args.task == "obb" else batch_size * 2,
-            rank=LOCAL_RANK,
-            mode="val",
-        )
+        self._build_train_pipeline()
         self.validator = self.get_validator()
+        if self.args.distill_model is not None and "dis_loss" not in self.loss_names:
+            self.loss_names += ("dis_loss",)
         self.ema = ModelEMA(self.model)
+        self.set_class_weights()  # compute class weights after dataloader is ready
         if RANK in {-1, 0}:
             metric_keys = self.validator.metrics.keys + self.label_loss_items(prefix="val")
             self.metrics = dict(zip(metric_keys, [0] * len(metric_keys)))
             if self.args.plots:
                 self.plot_training_labels()
 
-        # Optimizer
-        self.accumulate = max(round(self.args.nbs / self.batch_size), 1)  # accumulate loss before optimizing
-        weight_decay = self.args.weight_decay * self.batch_size * self.accumulate / self.args.nbs  # scale weight_decay
-        iterations = math.ceil(len(self.train_loader.dataset) / max(self.batch_size, self.args.nbs)) * self.epochs
-        self.optimizer = self.build_optimizer(
-            model=self.model,
-            name=self.args.optimizer,
-            lr=self.args.lr0,
-            momentum=self.args.momentum,
-            decay=weight_decay,
-            iterations=iterations,
-        )
-        # Scheduler
-        self._setup_scheduler()
         self.stopper, self.stop = EarlyStopping(patience=self.args.patience), False
         self.resume_training(ckpt)
         self.scheduler.last_epoch = self.start_epoch - 1  # do not move
         self.run_callbacks("on_pretrain_routine_end")
 
     def _do_train(self):
-        """Train the model with the specified world size."""
+        """Perform the full training loop including setup, epoch iteration, validation, and final evaluation."""
         if self.world_size > 1:
             self._setup_ddp()
         self._setup_train()
@@ -383,6 +412,7 @@ class BaseTrainer:
             self.plot_idx.extend([base_idx, base_idx + 1, base_idx + 2])
         epoch = self.start_epoch
         self.optimizer.zero_grad()  # zero any resumed gradients to ensure stability on train start
+        self._oom_retries = 0  # OOM auto-reduce counter for first epoch
         while True:
             self.epoch = epoch
             self.run_callbacks("on_train_epoch_start")
@@ -424,21 +454,49 @@ class BaseTrainer:
                             x["momentum"] = np.interp(ni, xi, [self.args.warmup_momentum, self.args.momentum])
                 
                 # Forward
-                with autocast(self.amp):
-                    batch = self.preprocess_batch(batch)
-                    if self.args.compile:
-                        # Decouple inference and loss calculations for improved compile performance
-                        preds = self.model(batch["img"])
-                        loss, self.loss_items = unwrap_model(self.model).loss(batch, preds)
-                    else:
-                        loss, self.loss_items = self.model(batch)
-                    self.loss = loss.sum()
-                    if RANK != -1:
-                        self.loss *= self.world_size
-                    self.tloss = self.loss_items if self.tloss is None else (self.tloss * i + self.loss_items) / (i + 1)
+                try:
+                    with autocast(self.amp):
+                        batch = self.preprocess_batch(batch)
+                        if self.args.compile:
+                            # Decouple inference and loss calculations for improved compile performance
+                            preds = self.model(batch["img"])
+                            loss, self.loss_items = unwrap_model(self.model).loss(batch, preds)
+                        else:
+                            loss, self.loss_items = self.model(batch)
+                        self.loss = loss.sum()
+                        if RANK != -1:
+                            self.loss *= self.world_size
+                        self.tloss = (
+                            self.loss_items if self.tloss is None else (self.tloss * i + self.loss_items) / (i + 1)
+                        )
 
-                # Backward
-                self.scaler.scale(self.loss).backward()
+                    # Backward
+                    self.scaler.scale(self.loss).backward()
+                except RuntimeError as e:
+                    is_oom = isinstance(e, torch.cuda.OutOfMemoryError)
+                    if not is_oom and not any(
+                        s in str(e) for s in ("CUDNN_STATUS_INTERNAL_ERROR", "unable to find an engine")
+                    ):
+                        raise
+                    if epoch > self.start_epoch or self._oom_retries >= 3 or RANK != -1:
+                        raise  # only auto-reduce during first epoch on single GPU, max 3 retries
+                    self._oom_retries += 1
+                    old_batch = self.batch_size
+                    self.args.batch = self.batch_size = max(self.batch_size // 2, 1)
+                    LOGGER.warning(
+                        f"{'CUDA out of memory' if is_oom else 'CUDA backend memory error'} with batch={old_batch}. "
+                        f"Reducing to batch={self.batch_size} and retrying ({self._oom_retries}/3)."
+                    )
+                    batch = loss = preds = None
+                    self.loss = self.loss_items = self.tloss = None
+                    self._clear_memory()
+                    self._build_train_pipeline()  # rebuild dataloaders, optimizer, scheduler
+                    self.scheduler.last_epoch = self.start_epoch - 1
+                    nb = len(self.train_loader)
+                    nw = max(round(self.args.warmup_epochs * nb), 100) if self.args.warmup_epochs > 0 else -1
+                    last_opt_step = -1
+                    self.optimizer.zero_grad()
+                    break  # restart epoch loop with reduced batch size
                 if ni - last_opt_step >= self.accumulate:
                     self.optimizer_step()
                     last_opt_step = ni
@@ -462,7 +520,7 @@ class BaseTrainer:
                             f"{epoch + 1}/{self.epochs}",
                             f"{self._get_memory():.3g}G",  # (GB) GPU memory util
                             *(self.tloss if loss_length > 1 else torch.unsqueeze(self.tloss, 0)),  # losses
-                            batch["cls"].shape[0],  # batch size, i.e. 8
+                            batch.get("cls", batch["img"]).shape[0],  # no. of instances
                             batch["img"].shape[-1],  # imgsz, i.e 640
                         )
                     )
@@ -471,6 +529,14 @@ class BaseTrainer:
                         self.plot_training_samples(batch, ni)
 
                 self.run_callbacks("on_train_batch_end")
+                if self.stop:
+                    break  # allow external stop (e.g. platform cancellation) between batches
+            else:
+                # for/else: this block runs only when the for loop completes without break (no OOM retry)
+                self._oom_retries = 0  # reset OOM counter after successful first epoch
+
+            if self._oom_retries and not self.stop:
+                continue  # OOM recovery broke the for loop, restart with reduced batch size
 
             if hasattr(unwrap_model(self.model).criterion, "update"):
                 unwrap_model(self.model).criterion.update()
@@ -484,7 +550,7 @@ class BaseTrainer:
             # Validation
             final_epoch = epoch + 1 >= self.epochs
             if self.args.val or final_epoch or self.stopper.possible_stop or self.stop:
-                self._clear_memory(threshold=0.5)  # prevent VRAM spike
+                self._clear_memory(None if self.device.type == "mps" else 0.5)  # prevent VRAM spike
                 self.metrics, self.fitness = self.validate()
 
             # NaN recovery
@@ -499,8 +565,7 @@ class BaseTrainer:
                     self.stop |= (time.time() - self.train_time_start) > (self.args.time * 3600)
 
                 # Save model
-                if self.args.save or final_epoch:
-                    self.save_model()
+                if (self.args.save or final_epoch) and self.save_model():
                     self.run_callbacks("on_model_save")
 
             # Scheduler
@@ -514,7 +579,8 @@ class BaseTrainer:
                 self.scheduler.last_epoch = self.epoch  # do not move
                 self.stop |= epoch >= self.epochs  # stop if exceeded epochs
             self.run_callbacks("on_fit_epoch_end")
-            self._clear_memory(0.5)  # clear if memory utilization > 50%
+            # clear if memory utilization > 50%; always clear on MPS due to leak https://github.com/ultralytics/ultralytics/issues/22621
+            self._clear_memory(None if self.device.type == "mps" else 0.5)
 
             # Early Stopping
             if RANK != -1:  # if DDP training
@@ -537,14 +603,16 @@ class BaseTrainer:
         unset_deterministic()
         self.run_callbacks("teardown")
 
-    def auto_batch(self, max_num_obj=0):
+    def auto_batch(self, max_num_obj=0, dataset_size=0):
         """Calculate optimal batch size based on model and device memory constraints."""
+        max_imgsz = int(self.args.imgsz * (1 + self.args.multi_scale))  # need not be stride-aligned
         return check_train_batch_size(
             model=self.model,
-            imgsz=self.args.imgsz,
+            imgsz=max_imgsz,
             amp=self.amp,
             batch=self.batch_size,
             max_num_obj=max_num_obj,
+            dataset_size=dataset_size,
         )  # returns batch size
 
     def _get_memory(self, fraction=False):
@@ -595,6 +663,17 @@ class BaseTrainer:
         """Save model training checkpoints with additional metadata."""
         import io
 
+        # Skip only genuinely non-finite fp32 EMA weights; fp16 overflow is handled on the saved copy below.
+        ema = unwrap_model(self.ema.ema)
+        if not all(torch.isfinite(v).all() for v in ema.state_dict().values() if isinstance(v, torch.Tensor)):
+            LOGGER.warning(f"Skipping checkpoint save at epoch {self.epoch}: EMA contains NaN/Inf")
+            return False
+        ema = deepcopy(ema).half()
+        # Clamp fp16 serialization overflow without mutating the live EMA.
+        for v in ema.state_dict().values():
+            if isinstance(v, torch.Tensor) and v.is_floating_point():
+                torch.nan_to_num_(v)
+
         # Serialize ckpt to a byte buffer once (faster than repeated torch.save() calls)
         buffer = io.BytesIO()
         torch.save(
@@ -602,7 +681,7 @@ class BaseTrainer:
                 "epoch": self.epoch,
                 "best_fitness": self.best_fitness,
                 "model": None,  # resume and final checkpoints derive from EMA
-                "ema": deepcopy(unwrap_model(self.ema.ema)).half(),
+                "ema": ema,
                 "updates": self.ema.updates,
                 "optimizer": convert_optimizer_state_dict_to_fp16(deepcopy(self.optimizer.state_dict())),
                 "scaler": self.scaler.state_dict(),
@@ -615,6 +694,7 @@ class BaseTrainer:
                     "root": str(GIT.root),
                     "branch": GIT.branch,
                     "commit": GIT.commit,
+                    "message": GIT.message,
                     "origin": GIT.origin,
                 },
                 "license": "AGPL-3.0 (https://ultralytics.com/license)",
@@ -631,6 +711,7 @@ class BaseTrainer:
             self.best.write_bytes(serialized_ckpt)  # save best.pt
         if (self.save_period > 0) and (self.epoch % self.save_period == 0):
             (self.wdir / f"epoch{self.epoch}.pt").write_bytes(serialized_ckpt)  # save epoch, i.e. 'epoch3.pt'
+        return True
 
     def get_dataset(self):
         """Get train and validation datasets from data dictionary.
@@ -639,15 +720,7 @@ class BaseTrainer:
             (dict): A dictionary containing the training/validation/test dataset and category names.
         """
         try:
-            # Convert ul:// platform URIs and NDJSON files to local dataset format first
-            data_str = str(self.args.data)
-            if data_str.endswith(".ndjson") or (data_str.startswith("ul://") and "/datasets/" in data_str):
-                import asyncio
-
-                from ultralytics.data.converter import convert_ndjson_to_yolo
-                from ultralytics.utils.checks import check_file
-
-                self.args.data = str(asyncio.run(convert_ndjson_to_yolo(check_file(self.args.data))))
+            self.args.data = convert_ndjson_to_yolo_if_needed(self.args.data)
 
             # Task-specific dataset checking
             if self.args.task == "classify":
@@ -658,6 +731,7 @@ class BaseTrainer:
                 "segment",
                 "pose",
                 "obb",
+                "semantic",
             }:
                 data = check_det_dataset(self.args.data)
                 if "yaml_file" in data:
@@ -674,7 +748,7 @@ class BaseTrainer:
         """Load, create, or download model for any task.
 
         Returns:
-            (dict): Optional checkpoint to resume training from.
+            (dict | None): Checkpoint to resume training from, or None if no checkpoint is loaded.
         """
         if isinstance(self.model, torch.nn.Module):  # if model is loaded beforehand. No setup needed
             return
@@ -684,9 +758,26 @@ class BaseTrainer:
         if str(self.model).endswith(".pt"):
             weights, ckpt = load_checkpoint(self.model)
             cfg = weights.yaml
-        elif isinstance(self.args.pretrained, (str, Path)):
+        if isinstance(self.args.pretrained, (str, Path)):
             weights, _ = load_checkpoint(self.args.pretrained)
-        self.model = self.get_model(cfg=cfg, weights=weights, verbose=RANK == -1)  # calls Model(cfg, weights)
+        elif self.args.pretrained is False and not self.resume:
+            weights = None
+
+        # rebuild DistillationModel from resuming checkpoint
+        if isinstance(weights, DistillationModel):
+            if RANK in {-1, 0}:
+                LOGGER.info("Resuming training DistillationModel from checkpoint weights")
+            student_model = self.get_model(cfg=cfg, weights=weights.student_model, verbose=RANK in {-1, 0})
+            student_model.args = self.args
+            # teacher is stripped from the checkpoint to save memory/disk; rebuild it from the distill_model path
+            teacher_model = weights.teacher_model if weights.teacher_model is not None else self.args.distill_model
+            model = DistillationModel(student_model=student_model, teacher_model=teacher_model)
+            if getattr(weights, "projector", None) is not None:
+                model.projector.load_state_dict(weights.projector.state_dict())  # restore the trained projector
+            model.criterion = None
+            self.model = model
+        else:
+            self.model = self.get_model(cfg=cfg, weights=weights, verbose=RANK in {-1, 0})  # calls Model(cfg, weights)
         return ckpt
 
     def optimizer_step(self):
@@ -700,15 +791,16 @@ class BaseTrainer:
             self.ema.update(self.model)
 
     def preprocess_batch(self, batch):
-        """Allow custom preprocessing model inputs and ground truths depending on task type."""
+        """Allow custom preprocessing of model inputs and ground truths depending on task type."""
         return batch
 
     def validate(self):
         """Run validation on val set using self.validator.
 
         Returns:
-            metrics (dict): Dictionary of validation metrics.
-            fitness (float): Fitness score for the validation.
+            (tuple): A tuple containing:
+                - metrics (dict | None): Dictionary of validation metrics, or None if validation was skipped.
+                - fitness (float | None): Fitness score for the validation, or None if validation was skipped.
         """
         if self.ema and self.world_size > 1:
             # Sync EMA buffers from rank 0 to all ranks
@@ -739,16 +831,20 @@ class BaseTrainer:
         raise NotImplementedError("build_dataset function not implemented in trainer")
 
     def label_loss_items(self, loss_items=None, prefix="train"):
-        """Return a loss dict with labeled training loss items tensor.
+        """Return a loss dict with labeled training loss items, or a list of loss names if loss_items is None.
 
         Notes:
-            This is not needed for classification but necessary for segmentation & detection
+            This is not needed for classification but necessary for segmentation & detection.
         """
         return {"loss": loss_items} if loss_items is not None else ["loss"]
 
     def set_model_attributes(self):
         """Set or update model parameters before training."""
         self.model.names = self.data["names"]
+
+    def set_class_weights(self):
+        """Compute and set class weights for handling class imbalance. Override in subclasses."""
+        pass
 
     def build_targets(self, preds, targets):
         """Build target tensors for training YOLO model."""
@@ -787,7 +883,7 @@ class BaseTrainer:
         self.plots[path] = {"data": data, "timestamp": time.time()}
 
     def final_eval(self):
-        """Perform final evaluation and validation for object detection YOLO model."""
+        """Perform final evaluation and validation for the YOLO model."""
         model = self.best if self.best.exists() else None
         with torch_distributed_zero_first(LOCAL_RANK):  # strip only on GPU 0; other GPUs should wait
             if RANK in {-1, 0}:
@@ -801,7 +897,9 @@ class BaseTrainer:
             self.validator.args.compile = False  # disable final val compile as too slow
             self.metrics = self.validator(model=model)
             self.metrics.pop("fitness", None)
+            self.epoch += 1  # log best metrics at step epochs+1, not overwriting last epoch
             self.run_callbacks("on_fit_epoch_end")
+            self.epoch -= 1  # restore epoch
 
     def check_resume(self, overrides):
         """Check if resume checkpoint exists and update arguments accordingly."""
@@ -810,8 +908,6 @@ class BaseTrainer:
             try:
                 exists = isinstance(resume, (str, Path)) and Path(resume).exists()
                 last = Path(check_file(resume) if exists else get_latest_run())
-
-                # Check that resume data YAML exists, otherwise strip to force re-download of dataset
                 ckpt_args = load_checkpoint(last)[0].args
                 if not isinstance(ckpt_args["data"], dict) and not Path(ckpt_args["data"]).exists():
                     ckpt_args["data"] = self.args.data
@@ -833,6 +929,7 @@ class BaseTrainer:
                     "freeze",
                     "val",
                     "plots",
+                    "distill_model",
                 ):  # allow arg updates to reduce memory or update device on resume
                     if k in overrides:
                         setattr(self.args, k, overrides[k])
@@ -879,30 +976,40 @@ class BaseTrainer:
             corrupted = broadcast_list[0]
         if not corrupted:
             return False
-        if epoch == self.start_epoch or not self.last.exists():
+        if epoch == self.start_epoch:
             LOGGER.warning(f"{reason} detected but can not recover from last.pt...")
             return False  # Cannot recover on first epoch, let training continue
+        if not self.last.exists():
+            raise RuntimeError(f"{reason} detected but no valid last.pt is available for recovery")
         self.nan_recovery_attempts += 1
         if self.nan_recovery_attempts > 3:
             raise RuntimeError(f"Training failed: NaN persisted for {self.nan_recovery_attempts} epochs")
         LOGGER.warning(f"{reason} detected (attempt {self.nan_recovery_attempts}/3), recovering from last.pt...")
         self._model_train()  # set model to train mode before loading checkpoint to avoid inference tensor errors
         _, ckpt = load_checkpoint(self.last)
-        ema_state = ckpt["ema"].float().state_dict()
+        ema = ckpt["ema"].float()
+        ema_state = ema.state_dict()
         if not all(torch.isfinite(v).all() for v in ema_state.values() if isinstance(v, torch.Tensor)):
             raise RuntimeError(f"Checkpoint {self.last} is corrupted with NaN/Inf weights")
-        unwrap_model(self.model).load_state_dict(ema_state)  # Load EMA weights into model
+        model = unwrap_model(self.model)
+        if hasattr(model, "student_model"):
+            # Distillation: the EMA is stripped of the teacher (rebuilt from the distill_model path), so only the
+            # student and projector are restored; loading them separately keeps a strict key match.
+            model.student_model.load_state_dict(ema.student_model.state_dict())
+            model.projector.load_state_dict(ema.projector.state_dict())
+        else:
+            model.load_state_dict(ema_state)  # Load EMA weights into model
         self._load_checkpoint_state(ckpt)  # Load optimizer/scaler/EMA/best_fitness
-        del ckpt, ema_state
+        del ckpt, ema, ema_state
         self.scheduler.last_epoch = epoch - 1
         return True
 
     def resume_training(self, ckpt):
-        """Resume YOLO training from given epoch and best fitness."""
+        """Resume YOLO training from a given checkpoint."""
         if ckpt is None or not self.resume:
             return
         start_epoch = ckpt.get("epoch", -1) + 1
-        assert start_epoch > 0, (
+        assert 0 < start_epoch < self.epochs, (
             f"{self.args.model} training to {self.epochs} epochs is finished, nothing to resume.\n"
             f"Start a new training without resuming, i.e. 'yolo train model={self.args.model}'"
         )
@@ -913,6 +1020,11 @@ class BaseTrainer:
             )
             self.epochs += ckpt["epoch"]  # finetune additional epochs
         self._load_checkpoint_state(ckpt)
+        if getattr(unwrap_model(self.model), "end2end", False):
+            # initialize loss and resume o2o and o2m args
+            unwrap_model(self.model).criterion = unwrap_model(self.model).init_criterion()
+            unwrap_model(self.model).criterion.updates = start_epoch - 1
+            unwrap_model(self.model).criterion.update()
         self.start_epoch = start_epoch
         if start_epoch > (self.epochs - self.args.close_mosaic):
             self._close_dataloader_mosaic()
@@ -980,7 +1092,7 @@ class BaseTrainer:
         else:
             raise NotImplementedError(
                 f"Optimizer '{name}' not found in list of available optimizers {optimizers}. "
-                "Request support for addition optimizers at https://github.com/ultralytics/ultralytics."
+                "Request support for additional optimizers at https://github.com/ultralytics/ultralytics."
             )
 
         num_params = [len(g[0]), len(g[1]), len(g[2])]  # number of param groups
@@ -993,8 +1105,9 @@ class BaseTrainer:
             g[3] = {"params": g[3], **optim_args, "weight_decay": decay, "use_muon": True, "param_group": "muon"}
             import re
 
-            # higher lr for certain parameters in MuSGD when funetuning
-            pattern = re.compile(r"(?=.*23)(?=.*cv3)|proto\.semseg")
+            # higher lr for certain parameters in MuSGD when finetuning
+            # proto.semseg is the checkpoint parameter name for YOLO26 semantic auxiliary heads.
+            pattern = re.compile(r"(?=.*23)(?=.*cv3)|proto\.semseg|SemanticSegment")
             g_ = []  # new param groups
             for x in g:
                 p = x.pop("params")
@@ -1009,3 +1122,124 @@ class BaseTrainer:
             f"{num_params[1]} weight(decay=0.0), {num_params[0]} weight(decay={decay}), {num_params[2]} bias(decay=0.0)"
         )
         return optimizer
+
+
+class MultiTrainer:
+    """Fine-tune a single base model across a collection of datasets and aggregate per-dataset results.
+
+    Used automatically by Model.train() when `data` is a list or tuple, allowing one base model to be benchmarked across
+    many datasets (such as the RF100 collection) in a single call. The datasets are fine-tuned in series and the same
+    base weights seed each run, so every run starts from an identical model. All output is grouped under one sweep
+    directory (e.g. runs/detect/multitrain): each dataset gets its own run subdirectory, and the per-dataset and mean
+    metrics are written to multitrain_results.json (for post-processing) alongside a multitrain_results.png bar
+    chart. The base model object is left unchanged; each dataset's fine-tuned weights live in its own run directory.
+
+    Attributes:
+        trainer (type[BaseTrainer]): Task trainer class instantiated once per dataset.
+        args (dict): Training arguments shared across datasets; its `data` key holds the dataset collection.
+        model (torch.nn.Module): Base model whose weights seed each per-dataset fine-tune.
+        callbacks (dict | None): Callbacks forwarded to each per-dataset trainer.
+        trainers (list[BaseTrainer]): Completed per-dataset trainers (hold results.csv, save_dir, and metrics).
+        metrics (dict): Mapping of each run name (e.g. coco8, coco8-2) to its training-metrics dict from the checkpoint.
+        save_dir (Path | None): Sweep directory holding the per-dataset runs and the results JSON/plot.
+
+    Examples:
+        Fine-tune one base model across several datasets and read back per-run metrics:
+        >>> from ultralytics import YOLO
+        >>> model = YOLO("yolo26n.pt")
+        >>> results = model.train(data=["coco8.yaml", "african-wildlife.yaml"], epochs=10)
+        >>> results["coco8"]["fitness"]  # final fitness on the coco8 run
+    """
+
+    def __init__(self, trainer, args, model, _callbacks: dict | None = None):
+        """Initialize MultiTrainer with a task trainer class, shared training arguments, and the base model.
+
+        Args:
+            trainer (type[BaseTrainer]): Task trainer class to run once per dataset.
+            args (dict): Training arguments; the `data` key holds the list/tuple of datasets to fine-tune on.
+            model (torch.nn.Module): Base model whose weights seed each per-dataset fine-tune.
+            _callbacks (dict, optional): Callback functions forwarded to each per-dataset trainer.
+        """
+        self.trainer = trainer
+        self.args = args
+        self.model = model
+        self.callbacks = _callbacks
+        self.trainers = []
+        self.metrics = {}
+        self.save_dir = None
+
+    def train(self):
+        """Fine-tune the base model on each dataset in series and return a {dataset: metrics} mapping."""
+        from types import SimpleNamespace
+
+        datasets = self.args["data"]
+        # Group every per-dataset run and the summary plot under one sweep directory, e.g. runs/detect/multitrain
+        sweep = SimpleNamespace(
+            project=self.args.get("project"),
+            task=self.args.get("task"),
+            mode="train",
+            exist_ok=self.args.get("exist_ok", False),
+        )
+        self.save_dir = get_save_dir(sweep, name="multitrain")
+        for i, data in enumerate(datasets):
+            LOGGER.info(f"\n{colorstr('blue', 'bold', f'MultiTrainer {i + 1}/{len(datasets)}:')} fine-tuning on {data}")
+            try:
+                overrides = {
+                    **self.args,
+                    "data": data,
+                    "project": str(self.save_dir),  # nest per-dataset runs inside the sweep directory
+                    "name": Path(str(data)).stem,
+                    "resume": False,
+                    "session": None,
+                }
+                trainer = self.trainer(overrides=overrides, _callbacks=self.callbacks)
+                trainer.model = trainer.get_model(weights=self.model, cfg=self.model.yaml)  # seed each run from base
+                trainer.train()
+                self.trainers.append(trainer)
+                # Key by the unique run name (e.g. coco8, coco8-2) so repeated datasets do not collapse. Use the
+                # in-memory metrics; only under DDP (validator ran in a subprocess) reload them from the checkpoint.
+                metrics = getattr(trainer.validator, "metrics", None)
+                if metrics is not None:
+                    metrics = metrics.results_dict
+                else:
+                    from ultralytics.utils.patches import torch_load
+
+                    ckpt = trainer.best if trainer.best.exists() else trainer.last
+                    metrics = torch_load(ckpt)["train_metrics"] if ckpt.exists() else None
+                self.metrics[trainer.save_dir.name] = metrics
+            except Exception as e:  # one bad dataset should not abort the whole sweep
+                LOGGER.error(f"MultiTrainer: fine-tuning on {data} failed, skipping: {e}")
+                self.metrics[Path(str(data)).stem] = None
+        if RANK in {-1, 0} and self.trainers:
+            self.save_dir.mkdir(parents=True, exist_ok=True)
+            self.save_results()  # JSON of per-dataset + mean metrics for programmatic post-processing
+            if self.args.get("plots", True):
+                self.plot_results()
+        return self.metrics
+
+    def save_results(self):
+        """Write per-dataset and mean metrics to multitrain_results.json for programmatic post-processing."""
+        import json
+
+        results = {run: ({k: float(v) for k, v in m.items()} if m else None) for run, m in self.metrics.items()}
+        valid = [m for m in results.values() if m]
+        keys = {k for m in valid for k in m}
+        mean = {k: sum(m[k] for m in valid if k in m) / sum(k in m for m in valid) for k in keys}
+        file = self.save_dir / "multitrain_results.json"
+        with open(file, "w", encoding="utf-8") as f:
+            json.dump({"results": results, "mean": mean}, f, indent=2)
+        LOGGER.info(f"MultiTrainer results saved to {colorstr('bold', file)}")
+        return file
+
+    def plot_results(self):
+        """Save a cross-dataset bar chart of the per-dataset metric with the mean across all datasets."""
+        from ultralytics.cfg import TASK2METRIC
+        from ultralytics.utils.plotting import plot_multitrain_results
+
+        key = TASK2METRIC.get(self.args.get("task"))
+        scores = {run: float(m.get(key, m.get("fitness", 0.0))) for run, m in self.metrics.items() if m}
+        if not scores:
+            return None
+        fname = plot_multitrain_results(scores, key=key or "fitness", save_dir=self.save_dir)
+        LOGGER.info(f"MultiTrainer results saved to {colorstr('bold', fname)}")
+        return fname
