@@ -17,6 +17,7 @@ from PIL import Image
 
 from tests import CFG, MODEL, MODELS, SOURCE, SOURCES_LIST, TASK_MODEL_DATA
 from ultralytics import RTDETR, YOLO
+from ultralytics.cfg import TASK2METRIC, TASKS
 from ultralytics.data.build import load_inference_source
 from ultralytics.data.utils import check_det_dataset
 from ultralytics.utils import (
@@ -46,6 +47,14 @@ def skip_rpi_semantic():
     """Skip semantic segmentation tests on Raspberry Pi due to memory constraints."""
     if IS_RASPBERRYPI:
         pytest.skip("Semantic segmentation tests are skipped on Raspberry Pi due to memory constraints.")
+
+
+def test_task_metric_registry():
+    """Ensure every registered task has a default metric for benchmark/tuning consumers."""
+    from ultralytics.utils.metrics import LocMetrics
+
+    assert set(TASK2METRIC) == set(TASKS)
+    assert TASK2METRIC["locate"] in LocMetrics().keys
 
 
 def test_model_forward():

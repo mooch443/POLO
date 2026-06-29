@@ -86,6 +86,7 @@ TASK2MODEL = {
 }
 TASK2METRIC = {
     "detect": "metrics/mAP50-95(B)",
+    "locate": "metrics/mAP100-10(L)",
     "segment": "metrics/mAP50-95(M)",
     "classify": "metrics/accuracy_top1",
     "pose": "metrics/mAP50-95(P)",
