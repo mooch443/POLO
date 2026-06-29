@@ -342,6 +342,10 @@ def test_export_tflite_matrix(task, dynamic, quantize, batch, nms, end2end):
     MACOS and checks.IS_PYTHON_MINIMUM_3_13,
     reason="coremltools deadlocks after OpenVINO on macOS Python 3.13 (conflicting OpenMP runtimes)",
 )
+@pytest.mark.skipif(
+    MACOS and TORCH_2_9,
+    reason="coremltools 9.0 fails to convert torch>=2.9 graphs on macOS",
+)
 def test_export_coreml(isolated_model):
     """Test YOLO export to CoreML format and check for errors."""
     # Capture stdout and stderr
@@ -364,6 +368,10 @@ def test_export_coreml(isolated_model):
 @pytest.mark.skipif(
     MACOS and checks.IS_PYTHON_MINIMUM_3_13,
     reason="coremltools deadlocks after OpenVINO on macOS Python 3.13 (conflicting OpenMP runtimes)",
+)
+@pytest.mark.skipif(
+    MACOS and TORCH_2_9,
+    reason="coremltools 9.0 fails to convert torch>=2.9 graphs on macOS",
 )
 def test_export_coreml_rtdetr():
     """Test RT-DETR export to CoreML format and check for errors."""

@@ -96,7 +96,7 @@ class LocalizationTrainer(BaseTrainer):
         base_cfg["ch"] = ch
         base_cfg["channels"] = ch
         model = LocalizationModel(base_cfg, nc=self.data["nc"], ch=ch, verbose=verbose and RANK == -1)
-        if weights:
+        if weights is not None:
             model.load(weights)
         return model
 

@@ -4,6 +4,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from tests import TASK2DATA
+from ultralytics import YOLO
 from ultralytics.engine.results import Results
 from ultralytics.models.yolo.locate import LocalizationPredictor, LocalizationValidator
 from ultralytics.utils import ops
@@ -178,6 +180,34 @@ def test_locate_validator_prediction_plots_pass_predicted_radii(monkeypatch):
 
     assert "radii" in call
     np.testing.assert_allclose(np.asarray(call["radii"]).reshape(-1), np.array([5.0, 8.0], dtype=np.float32))
+
+
+def test_locate_checkpoint_can_start_new_training(tmp_path):
+    """A saved POLO checkpoint should seed a fresh training run without using resume state."""
+    args = {
+        "data": TASK2DATA["locate"],
+        "epochs": 1,
+        "imgsz": 32,
+        "batch": 2,
+        "workers": 0,
+        "plots": False,
+        "cache": False,
+        "device": "cpu",
+        "project": tmp_path,
+        "exist_ok": True,
+    }
+
+    model = YOLO("ultralytics/cfg/models/26/polo26.yaml")
+    model.train(**args, name="seed")
+    checkpoint = model.trainer.last
+    assert checkpoint.exists()
+
+    fresh = YOLO(checkpoint)
+    fresh.train(**args, name="fresh", resume=False)
+
+    assert fresh.trainer.args.resume is False
+    assert fresh.trainer.start_epoch == 0
+    assert fresh.trainer.last.exists()
 
 
 def test_locate_loss_sanitizes_non_finite_logits():
