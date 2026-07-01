@@ -81,6 +81,36 @@ def test_locate_validator_uses_explicit_conf_everywhere(monkeypatch):
     assert call["conf_thres"] == 0.42
 
 
+def test_locate_matcher_deduplicates_labels_with_tie_break():
+    """Locate matching should keep the lowest-DoR detection per label and break ties by detection index."""
+    validator = LocalizationValidator(args={"max_det": 5})
+    validator.dorv = torch.tensor([0.30, 0.55])
+    true_cls = torch.tensor([0.0, 0.0, 1.0])
+    pred_cls = torch.tensor([0.0, 0.0, 0.0, 1.0, 1.0, 2.0])
+    dor = torch.tensor(
+        [
+            [0.20, 0.20, 0.50, 0.10, 0.10, 0.10],
+            [0.10, 0.10, 0.60, 0.10, 0.10, 0.10],
+            [0.10, 0.10, 0.10, 0.20, 0.20, 0.10],
+        ],
+        dtype=torch.float32,
+    )
+
+    correct = validator.match_predictions_loc(pred_classes=pred_cls, true_classes=true_cls, dor=dor)
+    expected = torch.tensor(
+        [
+            [True, True],
+            [False, False],
+            [False, True],
+            [True, True],
+            [False, False],
+            [False, False],
+        ]
+    )
+
+    torch.testing.assert_close(correct, expected)
+
+
 def test_locate_predictor_and_validator_share_default_candidate_policy(monkeypatch):
     """Default locate predictor and validator should both use the fast single-label candidate policy."""
     calls = []

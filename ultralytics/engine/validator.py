@@ -377,34 +377,45 @@ class BaseValidator:
         correct = torch.zeros((D, T), dtype=torch.bool, device=device)
         det_idx_all = torch.arange(D, device=device)
 
-        # Per-threshold vectorized selection
+        # The closest valid label for each detection is independent of the DoR threshold.
+        min_cost_per_det, arg_label_per_det = masked.min(dim=0)         # along rows (labels), each (D,)
+        has_scatter_reduce = hasattr(torch.Tensor, "scatter_reduce_") and device.type != "mps"
+
+        # Per-threshold selection
         for i in range(T):
             t = thr[i]
-            # Mask out costs above threshold
-            cand = torch.where(masked <= t, masked, inf)                # (L, D)
-
-            # Step 1: each detection picks its best label under this threshold
-            # min_cost_per_det: (D,), arg_label_per_det: (D,)
-            min_cost_per_det, arg_label_per_det = cand.min(dim=0)       # along rows (labels)
 
             # Valid proposals are finite
-            valid_det = torch.isfinite(min_cost_per_det)
+            valid_det = min_cost_per_det <= t
             if not valid_det.any():
                 continue
 
-            # Step 2: dedupe labels without scatter_reduce_ (MPS-safe)
+            # Step 2: dedupe labels. For each label, keep the proposal with the
+            # lowest DoR and use the smallest detection index as the tie-breaker.
             lbls = arg_label_per_det[valid_det]                         # (K,)
             costs = min_cost_per_det[valid_det]                         # (K,)
             dets = det_idx_all[valid_det]                                # (K,)
-            selected = torch.zeros((D,), dtype=torch.bool, device=device)
-            for lbl in lbls.unique():
-                lbl_mask = lbls == lbl
-                lbl_costs = costs[lbl_mask]
-                lbl_dets = dets[lbl_mask]
-                min_cost = lbl_costs.min()
-                best_dets = lbl_dets[lbl_costs == min_cost]
-                selected[best_dets.min()] = True  # tie-break by smallest detection index
-            correct[:, i] = selected
+            if has_scatter_reduce:
+                best_cost = torch.full((L,), inf, dtype=dor.dtype, device=device)
+                best_cost.scatter_reduce_(0, lbls, costs, reduce="amin", include_self=True)
+
+                sentinel = torch.tensor(D, dtype=dets.dtype, device=device)
+                best_det_candidates = torch.where(costs == best_cost[lbls], dets, sentinel)
+                best_det = torch.full((L,), D, dtype=dets.dtype, device=device)
+                best_det.scatter_reduce_(0, lbls, best_det_candidates, reduce="amin", include_self=True)
+
+                selected_det = best_det[best_det < D]
+                correct[selected_det, i] = True
+            else:
+                selected = torch.zeros((D,), dtype=torch.bool, device=device)
+                for lbl in lbls.unique():
+                    lbl_mask = lbls == lbl
+                    lbl_costs = costs[lbl_mask]
+                    lbl_dets = dets[lbl_mask]
+                    min_cost = lbl_costs.min()
+                    best_dets = lbl_dets[lbl_costs == min_cost]
+                    selected[best_dets.min()] = True  # tie-break by smallest detection index
+                correct[:, i] = selected
 
         return correct
 
