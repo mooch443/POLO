@@ -970,11 +970,25 @@ class BaseTrainer:
 
     def _handle_nan_recovery(self, epoch):
         """Detect and recover from NaN/Inf loss and fitness collapse by loading last checkpoint."""
+        # Non-finite live weights can be masked by losses that sanitize predictions (e.g. locate's nan_to_num),
+        # leaving the loss/fitness finite; detect them directly so the run still recovers instead of silently
+        # training a diverged model to completion.
+        model_nan = RANK in {-1, 0} and not all(
+            torch.isfinite(p).all() for p in unwrap_model(self.model).parameters()
+        )
         loss_nan = self.loss is not None and not self.loss.isfinite()
         fitness_nan = self.fitness is not None and not np.isfinite(self.fitness)
         fitness_collapse = self.best_fitness and self.best_fitness > 0 and self.fitness == 0
-        corrupted = RANK in {-1, 0} and loss_nan and (fitness_nan or fitness_collapse)
-        reason = "Loss NaN/Inf" if loss_nan else "Fitness NaN/Inf" if fitness_nan else "Fitness collapse"
+        corrupted = RANK in {-1, 0} and (model_nan or (loss_nan and (fitness_nan or fitness_collapse)))
+        reason = (
+            "Model NaN/Inf"
+            if model_nan
+            else "Loss NaN/Inf"
+            if loss_nan
+            else "Fitness NaN/Inf"
+            if fitness_nan
+            else "Fitness collapse"
+        )
         if RANK != -1:  # DDP: broadcast to all ranks
             broadcast_list = [corrupted if RANK == 0 else None]
             dist.broadcast_object_list(broadcast_list, 0)
