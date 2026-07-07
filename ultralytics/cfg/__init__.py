@@ -223,6 +223,7 @@ CFG_FRACTION_KEYS = frozenset(
         "hsv_h",
         "hsv_s",
         "hsv_v",
+        "photo_aug",
         "translate",
         "perspective",
         "flipud",

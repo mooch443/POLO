@@ -2072,7 +2072,7 @@ class Albumentations(BaseTransform):
         - Some transforms are applied with very low probability (0.01) by default.
     """
 
-    def __init__(self, p: float = 1.0, transforms: list | None = None) -> None:
+    def __init__(self, p: float = 1.0, transforms: list | None = None, photo_aug: float = 0.0) -> None:
         """Initialize the Albumentations transform object for YOLO bbox formatted parameters.
 
         This class applies various image augmentations using the Albumentations library, including Blur, Median Blur,
@@ -2082,6 +2082,7 @@ class Albumentations(BaseTransform):
         Args:
             p (float): Probability of applying the augmentations. Must be between 0 and 1.
             transforms (list | None): List of custom Albumentations transforms. If None, uses default transforms.
+            photo_aug (float): Probability of applying an extra photometric transform group.
         """
         self.p = p
         self.transform = None
@@ -2140,8 +2141,8 @@ class Albumentations(BaseTransform):
             }  # from https://albumentations.ai/docs/2-core-concepts/targets/
 
             # Transforms, use custom transforms if provided, otherwise use defaults
-            T = (
-                [
+            if transforms is None:
+                T = [
                     A.Blur(p=0.01),
                     A.MedianBlur(p=0.01),
                     A.ToGray(p=0.01),
@@ -2150,9 +2151,24 @@ class Albumentations(BaseTransform):
                     A.RandomGamma(p=0.0),
                     A.ImageCompression(quality_range=(75, 100), p=0.0),
                 ]
-                if transforms is None
-                else transforms
-            )
+            else:
+                T = list(transforms)
+            if photo_aug:
+                T.append(
+                    A.OneOf(
+                        [
+                            A.RandomBrightnessContrast(
+                                brightness_limit=(-0.45, 0.25),
+                                contrast_limit=(-0.25, 0.25),
+                                p=1.0,
+                            ),
+                            A.RandomGamma(gamma_limit=(45, 140), p=1.0),
+                            A.CLAHE(clip_limit=(1.0, 4.0), tile_grid_size=(8, 8), p=1.0),
+                            A.ImageCompression(quality_range=(55, 95), p=1.0),
+                        ],
+                        p=photo_aug,
+                    )
+                )
 
             # Compose transforms
             self.contains_spatial = any(transform.__class__.__name__ in spatial_transforms for transform in T)
@@ -2823,7 +2839,11 @@ def v8_transforms(dataset, imgsz: int, hyp: IterableSimpleNamespace, stretch: bo
             pre_transform,
             MixUp(dataset, pre_transform=pre_transform, p=hyp.mixup),
             CutMix(dataset, pre_transform=pre_transform, p=hyp.cutmix),
-            Albumentations(p=1.0, transforms=getattr(hyp, "augmentations", None)),
+            Albumentations(
+                p=1.0,
+                transforms=getattr(hyp, "augmentations", None),
+                photo_aug=getattr(hyp, "photo_aug", 0.0),
+            ),
             RandomHSV(hgain=hyp.hsv_h, sgain=hyp.hsv_s, vgain=hyp.hsv_v),
             RandomFlip(direction="vertical", p=hyp.flipud, flip_idx=flip_idx),
             RandomFlip(direction="horizontal", p=hyp.fliplr, flip_idx=flip_idx),
@@ -2848,7 +2868,11 @@ def v8_transforms_loc(dataset, imgsz: int, hyp: IterableSimpleNamespace, stretch
         [
             pre_transform,
             MixUp(dataset, pre_transform=pre_transform, p=hyp.mixup),
-            Albumentations(p=1.0, transforms=getattr(hyp, "augmentations", None)),
+            Albumentations(
+                p=1.0,
+                transforms=getattr(hyp, "augmentations", None),
+                photo_aug=getattr(hyp, "photo_aug", 0.0),
+            ),
             RandomHSV(hgain=hyp.hsv_h, sgain=hyp.hsv_s, vgain=hyp.hsv_v),
             RandomFlip(direction="vertical", p=hyp.flipud),
             RandomFlip(direction="horizontal", p=hyp.fliplr),
